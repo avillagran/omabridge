@@ -1,0 +1,201 @@
+{
+  "checked_at": "2026-10-17T22:26:02.309221+00:00",
+  "scope": "Document research only; no runtime validation. Hashes refer to locally retained retrieval bodies, not installed packages. Evidence files are temporary and not bundled. Branch tips are separately observed metadata, not exact pins for mutable retrievals.",
+  "sources": [
+    {
+      "url": "https://raw.githubusercontent.com/tailscale/tailcat/main/README.md",
+      "sha256": "a067585926480414c52f18dd168badaea11a1b5400fff84c2e05dcb50979fe31",
+      "local_evidence_file": "tailcat-readme.md",
+      "body_kind": "upstream raw text"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/pingdotgg/t3code/main/docs/internals/t3-connect.md",
+      "sha256": "e73906bcb19fcf0dddfcf1fdaccccaf6ed7950e649491e01fa62a7ba1a20e143",
+      "local_evidence_file": "t3-connect.md",
+      "body_kind": "upstream raw text"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/pingdotgg/t3code/main/docs/user/remote-access.md",
+      "sha256": "a0812c1f33f2e41c6de615085736700a1ba916d378e91caadc17d7e8a5fc772b",
+      "local_evidence_file": "t3-remote.md",
+      "body_kind": "upstream raw text"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/n0-computer/iroh-ffi/main/README.md",
+      "sha256": "4a12c5bc215c83c600e8f167fa16d2f024ed6ecd3fb2b393fa8dbaa2d77d580b",
+      "local_evidence_file": "iroh-ffi.md",
+      "body_kind": "upstream raw text"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/holepunchto/hyperdht/main/README.md",
+      "sha256": "c27721678a2bbcc784885fe2cc7ef9722209e9102ce13337ee880632741e642a",
+      "local_evidence_file": "hyperdht.md",
+      "body_kind": "upstream raw text"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/holesail/holesail/main/README.md",
+      "sha256": "b2d7cb178ee2147028cb74df9da721224296e2703c6a92cc466e53c657cf367b",
+      "local_evidence_file": "holesail.md",
+      "body_kind": "upstream raw text"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/n0-computer/iroh/main/README.md",
+      "sha256": "3375564eaa22eabea0d6b8440e9ef6fed2c282f24d02298e741a1d2dc05442b0",
+      "local_evidence_file": "iroh.md",
+      "body_kind": "upstream raw text"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/libp2p/rust-libp2p/master/README.md",
+      "sha256": "61d127bb3dd03c20cc5f0f9c98321232e1f561e712528c2cb43dfbcf073aacb8",
+      "local_evidence_file": "libp2p.md",
+      "body_kind": "upstream raw text"
+    },
+    {
+      "url": "https://tailscale.com/blog/tailcat",
+      "sha256": "4e76248706915deb4a24fc4214bb4a87f979d9419673d94110056db77652d451",
+      "local_evidence_file": "tailcat-blog.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://tailscale.com/docs/concepts/control-data-planes",
+      "sha256": "7ede96d7800301e8e3674a837e19ac54e55364e87ee32c291c9716983972002b",
+      "local_evidence_file": "tailscale-control.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://tailscale.com/docs/reference/connection-types",
+      "sha256": "932c201617600693501161eea307f1ef87562ab7dde6938831c6e465c6b21abb",
+      "local_evidence_file": "tailscale-connections.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://headscale.net/stable/",
+      "sha256": "3cda5dde5c0366dfaaa5ad3457138fe36c66a300f1ef0f6705f11eeb6d82ad32",
+      "local_evidence_file": "headscale.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://docs.iroh.computer/languages/wasm-browser.md",
+      "sha256": "582c80bfc866d7a4af48647384e6fd47826ffac066591aca93e3ff01daa1b6d7",
+      "local_evidence_file": "iroh-browser.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://docs.iroh.computer/connecting/dht-address-lookup.md",
+      "sha256": "c148bcc1905097a9bcd1e845bc2dfae575cc22b9fdd2c5f5fc25f169f8bfe461",
+      "local_evidence_file": "iroh-dht.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://docs.iroh.computer/concepts/security-privacy.md",
+      "sha256": "23a7c155f91a26bf1c72d73b5b8c1aebee7d7e13ff25648c6f34be88138dcf2b",
+      "local_evidence_file": "iroh-privacy.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://developer.android.com/develop/background-work/services/fgs/service-types",
+      "sha256": "c39e96bb4ee15eb748feef7bb124428aeb1100d9131bd828f03a794a9998fe2d",
+      "local_evidence_file": "android-bg.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://opentunnel.sh/",
+      "sha256": "937fd83fe3f109e0c205265e42ea619c7604a99cfc85df3a47365f3f0923c2fe",
+      "local_evidence_file": "opentunnel.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://docs.zerotier.com/protocol/",
+      "sha256": "0a54809ff2038bba7b1da29940ba8f32a431d9a4f452413d2048f0c1d2ad4df4",
+      "local_evidence_file": "zerotier.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://libp2p.io/docs/browser-connectivity/",
+      "sha256": "e788328f4a9bac4cdd5d177ae132229b024d7e3e6d78ec32f7c3341f6133d716",
+      "local_evidence_file": "libp2p-browser-new.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://libp2p.io/docs/webrtc-browser-connectivity/",
+      "sha256": "7dc00c83eb5544cef465d7731b86e4638d22353ea3e12065c00f26bf3b25631a",
+      "local_evidence_file": "libp2p-webrtc-new.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/libp2p/specs/master/relay/DCUtR.md",
+      "sha256": "0a7d8b49a37817e2a9b9a5302186f2dfe7b48bd4d1c55547effb92b24c6c1911",
+      "local_evidence_file": "libp2p-dcutr.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/slackhq/nebula/master/README.md",
+      "sha256": "6ca3bbe7f1e0b228fe9df844f25e43ae52277c38c15df51110c8b356137e5b85",
+      "local_evidence_file": "nebula.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://docs.iroh.computer/deployment/other-languages.md",
+      "sha256": "aa353aa4bb38eee5bd93617c82d3080c7b3faeea6cb6f05c15c769fe161d60cb",
+      "local_evidence_file": "iroh-languages.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/tailscale/tailcat/main/LICENSE",
+      "sha256": "be157f2795e76f34c085032e44bb345151e824dd18824ffce8079b3ce7101214",
+      "local_evidence_file": "tailcat-license.txt",
+      "body_kind": "extracted text"
+    },
+    {
+      "url": "https://developer.apple.com/tutorials/data/documentation/uikit/extending-your-app-s-background-execution-time.json",
+      "sha256": "2e07e9f04b60dbf86300b30dbd61043f8256daa5d7c69b165fa3b9f10b47412b",
+      "local_evidence_file": "apple-background.json",
+      "body_kind": "documentation JSON reserialized"
+    }
+  ],
+  "observed_branch_tips": [
+    {
+      "repo": "tailscale/tailcat",
+      "sha": "52fbad323e9d352f1febb623e0975368e9a8cbdd",
+      "committed_at": "2026-10-07T20:18:07Z"
+    },
+    {
+      "repo": "n0-computer/iroh",
+      "sha": "c6fba1b1423aa22d827cf54e73495e53fdc29275",
+      "committed_at": "2026-10-16T19:29:23Z"
+    },
+    {
+      "repo": "n0-computer/iroh-ffi",
+      "sha": "3103bf5295be6d50c5272ff7a426e9b539f3f587",
+      "committed_at": "2026-07-28T19:17:33Z"
+    },
+    {
+      "repo": "holepunchto/hyperdht",
+      "sha": "fdcda937d8cf3ca2e494396c430218e2996e6b29",
+      "committed_at": "2026-10-05T19:31:55Z"
+    },
+    {
+      "repo": "pingdotgg/t3code",
+      "sha": "07cb90286656393e395192d82f5c9980b604ef31",
+      "committed_at": "2026-10-17T22:16:13Z"
+    }
+  ],
+  "failed_or_unusable_retrievals": [
+    {
+      "url": "https://docs.libp2p.io/concepts/nat/hole-punching/",
+      "error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "https://docs.libp2p.io/guides/webrtc-browser-connectivity/",
+      "error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "https://developer.apple.com/documentation/uikit/extending-your-app-s-background-execution-time",
+      "error": "'utf-8' codec can't decode byte 0x8b in position 1: invalid start byte"
+    },
+    {
+      "url": "https://developer.apple.com/forums/thread/685525",
+      "error": "bot verification page"
+    }
+  ]
+}
