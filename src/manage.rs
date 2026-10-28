@@ -37,6 +37,7 @@ pub const FEATURES: &[&str] = &[
     "relay-host",
     "gateways",
     "delegated-enrollment-v1",
+    "t3-pair-v1",
     "mcp-service",
     "service-routes",
     "gateway-domain",

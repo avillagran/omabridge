@@ -14,11 +14,12 @@ pub mod mcp;
 pub(crate) mod network;
 pub mod relay;
 pub mod routes;
+pub mod t3_pair;
 pub mod theme;
 pub mod units;
 pub use network::{
     Client, Invitation, NetOptions, Node, Pipe, Relay, SYNC_INTERVAL, connect_through_server,
-    find_peer, forward_target, forward_through_server, unix_time,
+    find_peer, forward_target, forward_through_server, t3_pair_through_server, unix_time,
 };
 
 use anyhow::{Context, Result, ensure};

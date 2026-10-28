@@ -192,6 +192,8 @@ enum Request {
     Manage {
         command: serde_json::Value,
     },
+    /// A one-use native T3 pairing for a device this one shares `t3` with.
+    T3Pair,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
@@ -221,6 +223,9 @@ enum Response {
     },
     Managed {
         outcome: serde_json::Value,
+    },
+    T3Pairing {
+        pairing: crate::t3_pair::T3Pairing,
     },
 }
 
@@ -585,6 +590,18 @@ async fn control_request(
             }
         };
     }
+    // `{"t3Pair":"<peer id>"}`: a one-use T3 pairing from a peer that shares `t3`.
+    if let Some(peer) = request["t3Pair"].as_str() {
+        let result = async {
+            let (_, addr) = forward_target(store, peer, "t3", None).map_err(anyhow::Error::msg)?;
+            t3_pair_with(endpoint, options, &addr).await
+        }
+        .await;
+        return match result {
+            Ok(pairing) => json!({ "pairing": pairing }),
+            Err(error) => json!({ "error": t3_pair_error(&error) }),
+        };
+    }
     if let Some(spec) = request.get("delegatedEnroll") {
         let result: Result<crate::enrollment::Enrollment> = async {
             let peer = spec["peer"].as_str().context("missing peer")?;
@@ -813,6 +830,57 @@ async fn server_socket_request(
         }
         .await,
     )
+}
+
+/// Asks a peer that shares `t3` for a one-use native T3 pairing.
+async fn t3_pair_with(
+    endpoint: &Endpoint,
+    options: &NetOptions,
+    addr: &EndpointAddr,
+) -> Result<crate::t3_pair::T3Pairing> {
+    let (_pipe, response) = request(endpoint, options, addr, &Request::T3Pair)
+        .await
+        .map_err(|_| anyhow::Error::msg("omabridge_t3_pair_unavailable"))?;
+    match response {
+        Response::T3Pairing { pairing } => {
+            pairing.validate()?;
+            ensure!(
+                pairing.label == format!("{}{}", crate::t3_pair::LABEL_PREFIX, endpoint.id()),
+                "T3 pairing label mismatch"
+            );
+            Ok(pairing)
+        }
+        Response::Denied => bail!("omabridge_t3_pair_refused"),
+        _ => bail!("omabridge_t3_pair_unavailable"),
+    }
+}
+fn t3_pair_error(error: &anyhow::Error) -> &'static str {
+    let text = format!("{error}");
+    [
+        "omabridge_t3_pair_refused",
+        "omabridge_t3_pair_unavailable",
+        "omabridge_service_not_granted",
+        "omabridge_peer_unreachable",
+        "omabridge_peer_not_found",
+        "omabridge_peer_ambiguous",
+    ]
+    .into_iter()
+    .find(|code| text == *code)
+    .unwrap_or("omabridge_t3_pair_unavailable")
+}
+/// A one-use T3 pairing through this identity's running server. None when no
+/// server runs.
+pub async fn t3_pair_through_server(
+    store: &Store,
+    peer: &str,
+) -> Option<Result<crate::t3_pair::T3Pairing>> {
+    let answered = server_request(store, serde_json::json!({ "t3Pair": peer })).await?;
+    Some(answered.and_then(|(_, answer)| {
+        let pairing: crate::t3_pair::T3Pairing = serde_json::from_value(answer["pairing"].clone())
+            .map_err(|_| anyhow::Error::msg("omabridge_t3_pair_unavailable"))?;
+        pairing.validate()?;
+        Ok(pairing)
+    }))
 }
 
 /// Use only the already running endpoint: never create a duplicate identity.
@@ -1200,6 +1268,7 @@ impl Node {
         .await
     }
     /// Compose explicit enrollment authority and optional runtime tracking without widening either.
+    /// T3 pairings come from this user's own T3 Code (`~/.t3`) when `t3` is published.
     pub async fn start_reserved_with_configuration(
         store: Store,
         services: BTreeMap<String, SocketAddr>,
@@ -1207,6 +1276,27 @@ impl Node {
         reservation: RuntimeReservation,
         authority: Option<Arc<dyn crate::enrollment::EnrollmentAuthority>>,
         t3_runtime: Option<PathBuf>,
+    ) -> Result<Self> {
+        Self::start_with_t3_issuer(
+            store,
+            services,
+            options,
+            reservation,
+            authority,
+            t3_runtime,
+            None,
+        )
+        .await
+    }
+    /// As above, with the T3 Code that issues pairings: `Some(None)` issues none.
+    pub async fn start_with_t3_issuer(
+        store: Store,
+        services: BTreeMap<String, SocketAddr>,
+        options: NetOptions,
+        reservation: RuntimeReservation,
+        authority: Option<Arc<dyn crate::enrollment::EnrollmentAuthority>>,
+        t3_runtime: Option<PathBuf>,
+        t3_issuer: Option<Option<crate::t3_pair::T3Issuer>>,
     ) -> Result<Self> {
         if let Some(runtime) = &t3_runtime {
             ensure!(
@@ -1259,9 +1349,15 @@ impl Node {
         ));
         let announce = relay.clone();
         let listener = endpoint.clone();
+        let t3_issuer = match t3_issuer {
+            Some(issuer) => issuer,
+            None if services.contains_key("t3") => crate::t3_pair::T3Issuer::detect(),
+            None => None,
+        };
         let services = Arc::new(ServiceTargets {
             fixed: services,
             t3_runtime,
+            t3_issuer,
         });
         let capacity = Arc::new(Semaphore::new(64));
         let open: Arc<std::sync::Mutex<std::collections::HashMap<iroh::EndpointId, usize>>> =
@@ -1361,6 +1457,7 @@ impl Drop for Node {
 struct ServiceTargets {
     fixed: BTreeMap<String, SocketAddr>,
     t3_runtime: Option<PathBuf>,
+    t3_issuer: Option<crate::t3_pair::T3Issuer>,
 }
 
 impl ServiceTargets {
@@ -1556,6 +1653,28 @@ async fn serve_connection(
             // Restarting or stopping this service waits until the answer is out.
             deferred.flush();
         }
+        Request::T3Pair => {
+            let result: Result<crate::t3_pair::T3Pairing> = async {
+                ensure!(store.authorized(&peer, "t3")?, "T3 pairing refused");
+                let issuer = services
+                    .t3_issuer
+                    .as_ref()
+                    .context("T3 pairing unavailable")?;
+                let target = services.resolve("t3").context("T3 unavailable")?;
+                let pairing = issuer.issue(target, &peer).await?;
+                // Recheck the grant after an issuance that awaited I/O.
+                ensure!(store.authorized(&peer, "t3")?, "T3 pairing withdrawn");
+                Ok(pairing)
+            }
+            .await;
+            let response = match result {
+                Ok(pairing) => Response::T3Pairing { pairing },
+                Err(_) => Response::Denied,
+            };
+            write_header(&mut send, &response).await?;
+            send.finish()?;
+            let _ = timeout(DENIED_LINGER, connection.closed()).await;
+        }
         Request::Open {
             service,
             public,
@@ -1736,6 +1855,10 @@ impl Client {
             }
             _ => bail!("enrollment refused"),
         }
+    }
+    /// A one-use native T3 pairing from a device that shares `t3` with this one.
+    pub async fn t3_pair(&self, addr: &EndpointAddr) -> Result<crate::t3_pair::T3Pairing> {
+        t3_pair_with(&self.endpoint, &self.options, addr).await
     }
     /// Announces this device's name to every paired device with a known address
     /// and stores their current names and addresses. `own` is this device's

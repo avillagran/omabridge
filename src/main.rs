@@ -6,7 +6,8 @@ use clap::{Parser, Subcommand};
 use iroh::RelayUrl;
 use omabridge::{
     Client, Invitation, NetOptions, Node, PairDecision, Relay, Store, connect_through_server,
-    find_peer, forward_target, forward_through_server, read_document, unix_time, write_document,
+    find_peer, forward_target, forward_through_server, read_document, t3_pair_through_server,
+    unix_time, write_document,
 };
 use serde_json::json;
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -152,6 +153,13 @@ enum Command {
         peer: String,
         #[arg(long)]
         service: String,
+    },
+    /// Ask a paired device that shares `t3` for a one-use T3 pairing and print it
+    /// as JSON (`environmentId`, `credential`, `label`). Treat the output as secret.
+    T3Pair {
+        /// Endpoint ID or the device's name, when no other paired device has it.
+        #[arg(long)]
+        peer: String,
     },
 }
 
@@ -705,7 +713,21 @@ async fn run(args: Args) -> Result<()> {
                 SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, t3_port)),
             )]);
             let node =
-                match Node::start_reserved(store.clone(), targets, options, reservation).await {
+                // Pairings come from this owned T3, not from the user's own one.
+                match Node::start_with_t3_issuer(
+                    store.clone(),
+                    targets,
+                    options,
+                    reservation,
+                    None,
+                    None,
+                    Some(Some(omabridge::t3_pair::T3Issuer {
+                        cli: t3_binary.clone(),
+                        base_dir: t3_home.clone(),
+                    })),
+                )
+                .await
+                {
                     Ok(node) => node,
                     Err(error) => {
                         managed.stop().await?;
@@ -968,6 +990,21 @@ async fn run(args: Args) -> Result<()> {
             }
             // Tokio's stdin thread may still wait on a read nobody needs.
             std::process::exit(0);
+        }
+        Command::T3Pair { peer } => {
+            let peer = find_peer(&store, &peer).map_err(anyhow::Error::msg)?.id;
+            // Through a running server, like `connect`, so the device keeps one identity.
+            let pairing = if let Some(served) = t3_pair_through_server(&store, &peer).await {
+                served?
+            } else {
+                let (_, address) =
+                    forward_target(&store, &peer, "t3", None).map_err(anyhow::Error::msg)?;
+                let client = Client::new(store.clone(), options).await?;
+                let pairing = client.t3_pair(&address).await;
+                client.close().await;
+                pairing?
+            };
+            println!("{}", serde_json::to_string(&pairing)?);
         }
     }
     Ok(())

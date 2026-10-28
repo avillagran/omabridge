@@ -110,6 +110,28 @@ omabridge --name host --bind 0.0.0.0:41234 t3 --t3-binary "$(command -v t3)" \
 
 That home starts empty: it has no threads and no provider logins. T3's startup pairing URL is stored in a private `t3-*.private.log` under the state directory.
 
+## Adding a shared T3 Code to the other device's catalog
+
+A device that holds your `t3` grant can ask for a one-use native T3 pairing over
+the bridge, with nothing else open between the two machines (no SSH, port or
+account):
+
+```sh
+omabridge t3-pair --peer host    # {"environmentId":…,"credential":…,"label":"omabridge:<this device's id>"}
+```
+
+The serving device answers only a device whose authenticated endpoint id holds
+its current `t3` grant. It checks that the T3 behind its published `t3` service is
+this user's own T3 Code (`~/.t3`, or the owned home of `omabridge t3`), then issues
+the pairing with that T3's CLI (`t3 auth pairing create --ttl 2m --label
+omabridge:<peer>`). The asking device exchanges it through its `t3` forward for
+T3's own session, as T3 Connect does for an account's environments. Granting `t3`
+is the consent: from then on that device can act in your T3 Code with T3's
+default scopes. Withdrawing the grant stops new pairings at once. Sessions
+already issued are T3's, labelled `omabridge:<peer>`, and are revoked with
+`t3 auth session revoke` (Omarchy T3 Code does this by itself). Treat the
+command's output as secret. See [docs/t3-pairing.md](docs/t3-pairing.md).
+
 ## Authorized remote T3 catalog enrollment
 
 An opt-in selected bridge can delegate bounded read-only Android enrollment to a
@@ -218,6 +240,7 @@ See [docs/native-runtime.md](docs/native-runtime.md) for the full flow and for r
 - **Loopback only.** Forwards listen on loopback. Published targets must be explicit loopback addresses.
 - **Secrets stay out of view.** Invitations, keys and tokens are never printed to logs. Private state is mode 0700/0600.
 - **Relays see only ciphertext.** A relay only forwards encrypted QUIC and is never an enrollment authority. It does see endpoint IDs and IP addresses; use `--relay none` or your own relay to avoid n0's.
+- **A `t3` grant is T3 access.** A device holding it can obtain a one-use native T3 pairing (`t3-pair`) with T3's default scopes. Grant `t3` only to your own devices.
 - **No port attestation.** A published loopback port is trusted by address; OmaBridge does not verify which process owns it. Do not publish an untrusted local service under a well-known name such as `t3`.
 
 ## What does not work yet
@@ -232,6 +255,7 @@ See [docs/native-runtime.md](docs/native-runtime.md) for the full flow and for r
 ## Documentation
 
 - [Native runtime](docs/native-runtime.md): GUI, egress and private relay.
+- [T3 pairing over the bridge](docs/t3-pairing.md)
 - [MCP gateway for T3 Code](docs/chatgpt-mcp.md)
 - [Verification](docs/verification.md): what has been tested and how, including the multi-machine lab harnesses.
 - [Connectivity and performance](docs/connectivity-performance.md)
