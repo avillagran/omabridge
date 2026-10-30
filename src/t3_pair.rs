@@ -61,20 +61,27 @@ impl T3Issuer {
     /// This user's own T3 Code (`~/.t3`), when its CLI is installed.
     pub fn detect() -> Option<Self> {
         let home = PathBuf::from(std::env::var_os("HOME")?);
+        Self::detect_in(&home, std::env::var_os("PATH"))
+    }
+
+    /// The CLI of the T3 service that runs here comes first: `~/.t3/bin/t3`
+    /// may be the desktop app's launcher restored from another system, whose
+    /// app is gone, and every pairing would fail.
+    fn detect_in(home: &std::path::Path, path: Option<std::ffi::OsString>) -> Option<Self> {
         if !home.is_absolute() {
             return None;
         }
         let base_dir = home.join(".t3");
-        let cli = [base_dir.join("bin/t3"), home.join(".local/bin/t3")]
+        let cli = runtime_cli(&base_dir)
             .into_iter()
+            .chain([base_dir.join("bin/t3"), home.join(".local/bin/t3")])
             .chain(
-                std::env::var_os("PATH")
-                    .into_iter()
+                path.into_iter()
                     .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
                     .filter(|dir| dir.is_absolute())
                     .map(|dir| dir.join("t3")),
             )
-            .find(|path| is_executable(path))?;
+            .find(|path| is_executable(path) && !stale_desktop_launcher(path))?;
         Some(Self { cli, base_dir })
     }
 
@@ -140,7 +147,110 @@ impl T3Issuer {
     }
 }
 
+/// The T3 service's active version (`runtime/service-state.json`), as T3 runs it.
+fn runtime_cli(base_dir: &std::path::Path) -> Option<PathBuf> {
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(base_dir.join("runtime/service-state.json")).ok()?)
+            .ok()?;
+    let version = state["activeVersion"].as_str()?;
+    let valid = !version.is_empty()
+        && version.len() <= 64
+        && !version.starts_with('.')
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-+_".contains(&b));
+    valid.then(|| base_dir.join("runtime/versions").join(version).join("t3"))
+}
+
+/// A launcher written by T3's desktop app whose app is no longer installed.
+fn stale_desktop_launcher(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut text = String::new();
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if file.take(4096).read_to_string(&mut text).is_err() || !text.contains("# Written by T3 Code")
+    {
+        return false;
+    }
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("app='")?.strip_suffix('\''))
+        .is_some_and(|app| !is_executable(std::path::Path::new(app)))
+}
+
 fn is_executable(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn executable(path: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn launcher(app: &std::path::Path) -> String {
+        format!(
+            "#!/bin/sh\n# Written by T3 Code: runs the desktop app's bundled t3 CLI.\napp='{}'\nexec \"$app\" \"$@\"\n",
+            app.display()
+        )
+    }
+
+    #[test]
+    fn prefers_the_running_service_over_a_stale_desktop_launcher() {
+        let home = tempfile::tempdir().unwrap();
+        let t3 = home.path().join(".t3");
+        executable(
+            &t3.join("bin/t3"),
+            &launcher(&home.path().join("gone/t3code")),
+        );
+        assert_eq!(
+            T3Issuer::detect_in(home.path(), None),
+            None,
+            "a launcher whose app is gone is skipped"
+        );
+        std::fs::create_dir_all(t3.join("runtime")).unwrap();
+        std::fs::write(
+            t3.join("runtime/service-state.json"),
+            r#"{"protocol":3,"activeVersion":"0.1.4-nightly.1"}"#,
+        )
+        .unwrap();
+        executable(
+            &t3.join("runtime/versions/0.1.4-nightly.1/t3"),
+            "#!/bin/sh\n",
+        );
+        assert_eq!(
+            T3Issuer::detect_in(home.path(), None).unwrap().cli,
+            t3.join("runtime/versions/0.1.4-nightly.1/t3")
+        );
+    }
+
+    #[test]
+    fn keeps_a_working_desktop_launcher() {
+        let home = tempfile::tempdir().unwrap();
+        let app = home.path().join("opt/t3code");
+        executable(&app, "#!/bin/sh\n");
+        let cli = home.path().join(".t3/bin/t3");
+        executable(&cli, &launcher(&app));
+        assert_eq!(T3Issuer::detect_in(home.path(), None).unwrap().cli, cli);
+    }
+
+    #[test]
+    fn rejects_an_active_version_that_leaves_the_runtime() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("runtime")).unwrap();
+        for bad in ["../../bin", "", ".hidden", "a/b"] {
+            std::fs::write(
+                base.path().join("runtime/service-state.json"),
+                serde_json::json!({"activeVersion": bad}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(runtime_cli(base.path()), None, "{bad}");
+        }
+    }
 }
