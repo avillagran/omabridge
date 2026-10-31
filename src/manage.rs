@@ -37,12 +37,14 @@ pub const FEATURES: &[&str] = &[
     "relay-host",
     "gateways",
     "delegated-enrollment-v1",
+    "t3-pair-v1",
     "mcp-service",
     "service-routes",
     "gateway-domain",
+    "all-hosts-invite-v1",
 ];
 
-const ACTIONS: [&str; 18] = [
+const ACTIONS: [&str; 19] = [
     "identity-create",
     "invite",
     "invite-discard",
@@ -61,10 +63,11 @@ const ACTIONS: [&str; 18] = [
     "gateway-set",
     "grant-set",
     "gateway-domain-set",
+    "bridge-consent-set",
 ];
 
 /// What a managing device may ask: never identities, invitations, pairing
-/// from this device or who else may manage it.
+/// from this device, who else may manage it or which bridge may broker it.
 pub const REMOTE_ACTIONS: [&str; 9] = [
     "read",
     "rename",
@@ -132,6 +135,9 @@ pub struct Manager {
     /// How long `publish` waits for the published service to come up.
     pub publish_wait: Duration,
     pub pair_timeout: Duration,
+    /// Commands come from a managing device, not this device's own user. Such a
+    /// device approves nothing that reaches beyond this one.
+    pub remote: bool,
 }
 
 fn home() -> Outcome<PathBuf> {
@@ -331,6 +337,7 @@ impl Manager {
             t3_runtime: t3_home.join("userdata/server-runtime.json"),
             publish_wait: Duration::from_secs(5),
             pair_timeout: Duration::from_secs(30),
+            remote: false,
         })
     }
 
@@ -457,6 +464,29 @@ impl Manager {
                 // The device learns its new grants within seconds.
                 json!({ "announced": self.announce().await.unwrap_or(Value::Null) })
             }
+            "bridge-consent-set" => {
+                let peer = text(request, "peer");
+                let Some(allowed) = request["allowed"].as_bool() else {
+                    return Err("invalid_command");
+                };
+                if !valid_peer(peer) {
+                    return Err("invalid_command");
+                }
+                let store = self.store()?;
+                let known = store
+                    .peers()
+                    .map_err(|_| "omabridge_command_failed")?
+                    .into_iter()
+                    .find(|item| item.id == peer)
+                    .ok_or("omabridge_peer_not_found")?;
+                if allowed && !known.services.contains("t3") {
+                    return Err("omabridge_service_not_granted");
+                }
+                store
+                    .set_bridge_consent(peer, allowed)
+                    .map_err(|_| "omabridge_command_failed")?;
+                json!({ "announced": self.announce().await.unwrap_or(Value::Null) })
+            }
             "relay-set" => {
                 self.relay_set(text(request, "relay"))?;
                 json!({})
@@ -525,10 +555,15 @@ impl Manager {
                 "services": peer.services, "remoteServices": peer.remote_services,
                 "admin": peer.admin, "managed": peer.managed,
                 "public": peer.public, "remotePublic": peer.remote_public,
+                "allHosts": peer.all_hosts, "remoteAllHosts": peer.remote_all_hosts,
+                "bridgeConsent": peer.bridge_consent,
+                "remoteBridgeConsent": peer.remote_bridge_consent,
+                "remoteRoutes": peer.remote_routes,
             })).collect::<Vec<_>>(),
             "pending": pending.iter().map(|item| json!({
                 "id": item.peer.id, "name": item.peer.name,
                 "services": item.peer.services, "expires": item.expires,
+                "allHosts": item.peer.all_hosts,
             })).collect::<Vec<_>>(),
             "awaiting": self.awaiting(),
             "published": self.published(store.as_ref()),
@@ -648,6 +683,10 @@ impl Manager {
         {
             return Err("invalid_command");
         }
+        let all_hosts = request["allHosts"] == true;
+        if all_hosts && !services.iter().any(|service| service == "t3") {
+            return Err("invalid_command");
+        }
         let ttl = request["ttl"].as_u64().unwrap_or(600);
         if !(60..=3600).contains(&ttl) {
             return Err("invalid_command");
@@ -671,9 +710,13 @@ impl Manager {
             "omabridge-invite-{now}-{:04x}.json",
             rand::random::<u16>()
         ));
-        let token = store
-            .create_invite(&services, Duration::from_secs(ttl), now)
-            .map_err(|_| "omabridge_command_failed")?;
+        let lifetime = Duration::from_secs(ttl);
+        let token = if all_hosts {
+            store.create_all_hosts_invite(&services, lifetime, now)
+        } else {
+            store.create_invite(&services, lifetime, now)
+        }
+        .map_err(|_| "omabridge_command_failed")?;
         let invite = Invitation {
             version: 1,
             address,
@@ -693,6 +736,7 @@ impl Manager {
             "expires": invite.expires,
             "services": services,
             "manage": invite.manage,
+            "allHosts": all_hosts,
             "qrImage": qr,
         }))
     }
@@ -888,6 +932,11 @@ impl Manager {
                 .find(|item| request["expires"].as_u64() == Some(item.expires))
                 .ok_or("omabridge_request_changed")?,
         };
+        // Checked on the invitation being approved, so a claim arriving after any
+        // earlier look cannot slip through.
+        if self.remote && chosen.peer.all_hosts {
+            return Err("omabridge_remote_forbidden");
+        }
         store
             .approve_selected(
                 peer,
@@ -1738,6 +1787,7 @@ async fn run_remote(
     )?;
     manager.units = Units::new(units::user_unit_dir().map_err(|_| "local_error")?, deferred);
     manager.publish_wait = Duration::ZERO;
+    manager.remote = true;
     let previous = Relay::load(store.root()).unwrap_or_default();
     let mut command = command.clone();
     command["confirmed"] = json!(true);

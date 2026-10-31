@@ -193,6 +193,51 @@ fn redeem_with_http_clock(
     )
 }
 
+/// Longest session T3 is expected to grant through a pairing, plus some room.
+const NATIVE_SESSION_LIMIT_SECS: i64 = 31 * 24 * 60 * 60;
+
+/// Redeem a pairing from `Client::t3_host_pair` at a descriptor-verified route.
+/// This is the write-capable path: the session has T3's default scopes and lifetime
+/// (30 days), unlike `redeem`, which stays bounded read-only. `now` is taken before
+/// the exchange, so latency can only shorten the local lifetime.
+pub fn redeem_pairing(
+    pairing: &crate::t3_pair::T3Pairing,
+    url: &str,
+    now: u64,
+) -> Result<serde_json::Value> {
+    pairing.validate()?;
+    let paired = t3_protocol::pair_bearer(
+        url,
+        &pairing.credential,
+        Some(&pairing.environment_id),
+        &t3_protocol::PairingClient::default()
+            .with_device_type("mobile")
+            .with_os("android"),
+        &t3_protocol::ConnectionOptions::default(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    ensure!(
+        paired
+            .scope
+            .split_whitespace()
+            .any(|scope| scope == "orchestration:operate"),
+        "native_session_invalid"
+    );
+    let ttl = paired
+        .expires_in
+        .filter(|ttl| *ttl > 0 && *ttl <= NATIVE_SESSION_LIMIT_SECS)
+        .context("native_session_invalid")? as u64;
+    let expiry = now.saturating_add(ttl * 1000);
+    Ok(serde_json::json!({
+        "accessToken": paired.access_token.as_str(),
+        "environmentId": paired.environment_id,
+        "expiresAt": expiry,
+        "renewAfter": expiry.saturating_sub(crate::catalog_client::NATIVE_RENEW_BEFORE_MS),
+        "scope": paired.scope,
+        "status": crate::catalog_client::NATIVE_AUTHORIZED,
+    }))
+}
+
 fn parse_expiry(value: &serde_json::Value) -> Result<u64> {
     let text = value.as_str().context("missing session expiry")?;
     let parsed = time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)

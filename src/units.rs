@@ -178,7 +178,7 @@ pub fn render(context: &UnitContext, spec: &UnitSpec) -> Result<String> {
     };
     ensure!(args.iter().all(|arg| safe_arg(arg)), "unsafe unit argument");
     Ok(format!(
-        "{MARKER}\n[Unit]\nDescription={description}\n\n[Service]\nType=simple\nExecStart={}\nRestart=on-failure\nRestartSec=5\nNoNewPrivileges=yes\n\n[Install]\nWantedBy=default.target\n",
+        "{MARKER}\n[Unit]\nDescription={description}\n\n[Service]\nType=simple\nExecStart={}\nRestart=on-failure\nRestartSec=5\nNoNewPrivileges=yes\nMemoryHigh=1G\nMemoryMax=2G\n\n[Install]\nWantedBy=default.target\n",
         args.join(" ")
     ))
 }

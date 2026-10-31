@@ -689,6 +689,12 @@ impl Manager {
                     .collect::<Vec<_>>()
                     .join(", ");
                 ui.label(format!("{}: {services}", lang.text("Permisos", "Grants")));
+                if pending.peer.all_hosts {
+                    ui.label(lang.text(
+                        "Todos los hosts: acceso de escritura a cada host que consintió.",
+                        "All hosts: write access to every host that consented.",
+                    ));
+                }
                 if pending.expires <= now {
                     ui.label(lang.text("Expirada", "Expired"));
                 } else if ui

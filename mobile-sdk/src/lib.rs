@@ -118,7 +118,11 @@ fn call(v: Value) -> Result<Value> {
             let decision =
                 s.runtime
                     .block_on(s.client.pair(&invite, "Android", omabridge::unix_time()?))?;
-            Ok(json!({"approved":matches!(decision,omabridge::PairDecision::Approved{..})}))
+            let (approved, all_hosts) = match decision {
+                omabridge::PairDecision::Approved { all_hosts, .. } => (true, all_hosts),
+                omabridge::PairDecision::Pending => (false, false),
+            };
+            Ok(json!({"approved":approved,"allHosts":all_hosts}))
         }
         "selectBridge" => {
             let peer = text(&v, "bridgeId")?;
@@ -153,6 +157,27 @@ fn call(v: Value) -> Result<Value> {
             let http = None;
             let mut receipt =
                 omabridge::enrollment::redeem_with_http(&enrollment, &url, received_at, http)?;
+            receipt["baseUrl"] = json!(url);
+            receipt["provenance"] =
+                json!(format!("bridge:{}:{}", manager.bridge().id, s.store.id()?));
+            Ok(receipt)
+        }
+        // All-hosts path: a native session with write access. Also renews one; the
+        // read-only `enroll` above never touches a row this op filled.
+        "hostPair" => {
+            let now = unix_millis()?;
+            let id = text(&v, "environmentId")?;
+            let manager = s.manager.as_ref().context("bridge_not_selected")?;
+            let url = manager.enrollment_route(id, now)?;
+            let pairing = s
+                .runtime
+                .block_on(s.client.t3_host_pair(manager.bridge(), id))?;
+            let received_at = unix_millis()?;
+            anyhow::ensure!(
+                manager.enrollment_route(id, received_at)? == url,
+                "route unavailable"
+            );
+            let mut receipt = omabridge::enrollment::redeem_pairing(&pairing, &url, received_at)?;
             receipt["baseUrl"] = json!(url);
             receipt["provenance"] =
                 json!(format!("bridge:{}:{}", manager.bridge().id, s.store.id()?));
@@ -237,6 +262,11 @@ pub unsafe extern "C" fn omabridge_mobile_call(
                     "enrollment must be bounded read-only",
                     "descriptor identity mismatch",
                     "T3 session issuance failed",
+                    "omabridge_host_pair_refused",
+                    "omabridge_host_pair_unavailable",
+                    "native_session_invalid",
+                    "pairing_rejected",
+                    "t3_environment_mismatch",
                 ];
                 let code = error
                     .chain()

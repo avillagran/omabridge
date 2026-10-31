@@ -47,7 +47,43 @@ pub(crate) fn for_peer(store: &Store, peer: &str) -> Vec<ServiceRoute> {
         .collect()
 }
 
+/// Routes to this device's own T3, for a bridge it consented to. Other peers
+/// learn nothing: a route is a hint, but still names a host.
+pub(crate) fn own_for_peer(store: &Store, peer: &crate::Peer) -> Vec<ServiceRoute> {
+    if !peer.bridge_consent || !peer.services.contains("t3") {
+        return Vec::new();
+    }
+    let now = crate::unix_time().unwrap_or(0);
+    let mut routes = store.service_routes(now).unwrap_or_default();
+    routes.retain(|route| route.service == "t3");
+    routes.truncate(gateway::MAX_GATEWAYS);
+    routes
+}
+
 impl Store {
+    /// A host's announcement to its bridge. Only ever writes what the host
+    /// reported; this device's own consent bit is out of reach here.
+    pub(crate) fn refresh_host(
+        &self,
+        id: &str,
+        consent: bool,
+        routes: &[ServiceRoute],
+    ) -> Result<()> {
+        ensure!(
+            routes.len() <= gateway::MAX_GATEWAYS
+                && routes
+                    .iter()
+                    .all(|route| route.service == "t3" && route.valid()),
+            "invalid host routes"
+        );
+        self.update(|state| {
+            let peer = state.peers.get_mut(id).context("unknown peer")?;
+            peer.remote_bridge_consent = consent;
+            peer.remote_routes = if consent { routes.to_vec() } else { Vec::new() };
+            Ok(())
+        })
+    }
+
     pub(crate) fn refresh_routes(&self, id: &str, routes: &[ServiceRoute], now: u64) -> Result<()> {
         ensure!(
             routes.len() <= gateway::MAX_GATEWAYS && routes.iter().all(ServiceRoute::valid),
@@ -180,6 +216,73 @@ mod tests {
             ],
         )?;
         assert_eq!(for_peer(&gateway, &owner.id()?), vec![route]);
+        Ok(())
+    }
+
+    #[test]
+    fn host_routes_need_consent_https_and_never_touch_local_consent() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let bridge = Store::open(&dir.path().join("bridge"), "bridge")?;
+        let host = Store::open(&dir.path().join("host"), "host")?;
+        let id = host.id()?;
+        let token = bridge.create_invite(&["t3".into()], Duration::from_secs(60), 100)?;
+        bridge.claim(&token, &id, "host", 100)?;
+        bridge.approve(&id, 100)?;
+        let route = ServiceRoute {
+            service: "t3".into(),
+            url: "https://host.example.net/".into(),
+        };
+        for url in [
+            "http://host.example.net/",
+            "https://127.0.0.1/",
+            "https://host.example.net/x",
+        ] {
+            let invalid = ServiceRoute {
+                url: url.into(),
+                ..route.clone()
+            };
+            assert!(bridge.refresh_host(&id, true, &[invalid]).is_err());
+        }
+        let mcp = ServiceRoute {
+            service: "mcp".into(),
+            ..route.clone()
+        };
+        assert!(bridge.refresh_host(&id, true, &[mcp]).is_err());
+        assert!(!bridge.peers()?[0].remote_bridge_consent);
+
+        bridge.refresh_host(&id, true, std::slice::from_ref(&route))?;
+        let peer = &bridge.peers()?[0];
+        assert!(peer.remote_bridge_consent);
+        assert_eq!(peer.remote_routes, vec![route.clone()]);
+        assert!(
+            !peer.bridge_consent && !bridge.bridge_consented(&id)?,
+            "an announcement sets only what the peer reported"
+        );
+        bridge.refresh_host(&id, false, std::slice::from_ref(&route))?;
+        assert!(bridge.peers()?[0].remote_routes.is_empty());
+        assert!(bridge.refresh_host("stranger", true, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn own_routes_go_only_to_a_consented_bridge() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let host = Store::open(&dir.path().join("host"), "host")?;
+        let bridge = Store::open(&dir.path().join("bridge"), "bridge")?;
+        let id = bridge.id()?;
+        let token = host.create_invite(&["t3".into()], Duration::from_secs(60), 100)?;
+        host.claim(&token, &id, "bridge", 100)?;
+        host.approve(&id, 100)?;
+        host.set_services(&id, &["t3".into()], &["t3".into()])?;
+        let route = ServiceRoute {
+            service: "t3".into(),
+            url: "https://host.example.net/".into(),
+        };
+        host.refresh_routes(&id, std::slice::from_ref(&route), crate::unix_time()?)?;
+        let peer = |store: &Store| store.peers().map(|peers| peers[0].clone());
+        assert!(own_for_peer(&host, &peer(&host)?).is_empty());
+        host.set_bridge_consent(&id, true)?;
+        assert_eq!(own_for_peer(&host, &peer(&host)?), vec![route]);
         Ok(())
     }
 }

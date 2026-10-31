@@ -14,11 +14,12 @@ pub mod mcp;
 pub(crate) mod network;
 pub mod relay;
 pub mod routes;
+pub mod t3_pair;
 pub mod theme;
 pub mod units;
 pub use network::{
     Client, Invitation, NetOptions, Node, Pipe, Relay, SYNC_INTERVAL, connect_through_server,
-    find_peer, forward_target, forward_through_server, unix_time,
+    find_peer, forward_target, forward_through_server, t3_pair_through_server, unix_time,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -89,6 +90,10 @@ struct Invite {
     services: BTreeSet<String>,
     pending: Option<(String, String)>,
     approved: bool,
+    /// Opt-in: approving also gives the peer every host that consented. Stays
+    /// local: it is never in the wire `Invitation`.
+    #[serde(default)]
+    all_hosts: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,6 +121,57 @@ pub struct Peer {
     pub gateway_routes: Vec<routes::ServiceRoute>,
     #[serde(default)]
     pub routes_updated: u64,
+    /// This device approved the peer through an all-hosts invitation. Needs a
+    /// current `t3` grant too; a new approval or losing `t3` replaces it.
+    #[serde(default)]
+    pub all_hosts: bool,
+    /// The peer approved this device through an all-hosts invitation. A hint for
+    /// choosing a request; the peer decides.
+    #[serde(default)]
+    pub remote_all_hosts: bool,
+    /// Local consent: this device lets the peer, as a bridge, invite devices with
+    /// full access to it. Only this device's own front ends change it; a `t3`
+    /// grant alone never implies it and losing `t3` clears it.
+    #[serde(default)]
+    pub bridge_consent: bool,
+    /// The peer announced that it gave this device `bridge_consent`. A hint for
+    /// discovery; the peer checks its own bit on every request.
+    #[serde(default)]
+    pub remote_bridge_consent: bool,
+    /// HTTPS routes to the peer's own T3 it announced, consent given.
+    #[serde(default)]
+    pub remote_routes: Vec<routes::ServiceRoute>,
+}
+
+impl Peer {
+    fn new(id: String, name: String, services: BTreeSet<String>) -> Self {
+        Self {
+            id,
+            name,
+            services,
+            remote_services: BTreeSet::new(),
+            address: None,
+            public: BTreeSet::new(),
+            remote_public: BTreeSet::new(),
+            admin: false,
+            managed: false,
+            gateway_routes: Vec::new(),
+            routes_updated: 0,
+            all_hosts: false,
+            remote_all_hosts: false,
+            bridge_consent: false,
+            remote_bridge_consent: false,
+            remote_routes: Vec::new(),
+        }
+    }
+
+    /// Whatever hangs on `t3` must be asked for again once the grant is gone.
+    fn drop_t3_rights(&mut self) {
+        if !self.services.contains("t3") {
+            self.all_hosts = false;
+            self.bridge_consent = false;
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -142,17 +198,8 @@ fn pending_invitations(invites: BTreeMap<String, Invite>) -> Vec<PendingInvitati
         .filter_map(|(invitation_id, invite)| {
             invite.pending.map(|(id, name)| PendingInvitation {
                 peer: Peer {
-                    id,
-                    name,
-                    services: invite.services,
-                    remote_services: BTreeSet::new(),
-                    address: None,
-                    public: BTreeSet::new(),
-                    remote_public: BTreeSet::new(),
-                    admin: false,
-                    managed: false,
-                    gateway_routes: Vec::new(),
-                    routes_updated: 0,
+                    all_hosts: invite.all_hosts,
+                    ..Peer::new(id, name, invite.services)
                 },
                 invitation_id,
                 expires: invite.expires,
@@ -286,7 +333,12 @@ fn token_hash(token: &str) -> Result<String> {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PairDecision {
     Pending,
-    Approved { services: Vec<String> },
+    Approved {
+        services: Vec<String>,
+        /// The approved invitation was an all-hosts one. Older devices ignore it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        all_hosts: bool,
+    },
 }
 
 impl Store {
@@ -390,7 +442,13 @@ impl Store {
         Ok(file)
     }
 
-    fn remember_peer(&self, address: &EndpointAddr, name: &str, services: &[String]) -> Result<()> {
+    fn remember_peer(
+        &self,
+        address: &EndpointAddr,
+        name: &str,
+        services: &[String],
+        all_hosts: bool,
+    ) -> Result<()> {
         ensure!(valid_device_name(name), "invalid device name");
         let address = &sanitize_address(address);
         ensure!(
@@ -403,21 +461,13 @@ impl Store {
                 state.peers.len() < 256 || state.peers.contains_key(&id),
                 "peer capacity reached"
             );
-            let peer = state.peers.entry(id.clone()).or_insert_with(|| Peer {
-                id,
-                name: name.to_owned(),
-                services: BTreeSet::new(),
-                remote_services: BTreeSet::new(),
-                address: None,
-                public: BTreeSet::new(),
-                remote_public: BTreeSet::new(),
-                admin: false,
-                managed: false,
-                gateway_routes: Vec::new(),
-                routes_updated: 0,
-            });
+            let peer = state
+                .peers
+                .entry(id.clone())
+                .or_insert_with(|| Peer::new(id, name.to_owned(), BTreeSet::new()));
             peer.name = name.to_owned();
             peer.remote_services = services.iter().cloned().collect();
+            peer.remote_all_hosts = all_hosts;
             peer.address = Some(address.clone());
             Ok(())
         })
@@ -449,6 +499,7 @@ impl Store {
             let entry = state.peers.get_mut(peer).context("peer not found")?;
             entry.services = services.iter().cloned().collect();
             entry.public = public.iter().cloned().collect();
+            entry.drop_t3_rights();
             entry.gateway_routes.retain(|route| {
                 entry.services.contains(&route.service) && entry.public.contains(&route.service)
             });
@@ -477,6 +528,40 @@ impl Store {
             state.peers.get_mut(peer).context("peer not found")?.admin = allowed;
             Ok(())
         })
+    }
+
+    /// Lets a paired device, as a bridge, invite devices with full access to this
+    /// one, or stops it. Only this device's own front ends call this.
+    pub fn set_bridge_consent(&self, peer: &str, allowed: bool) -> Result<()> {
+        self.update(|state| {
+            let entry = state.peers.get_mut(peer).context("peer not found")?;
+            ensure!(
+                !allowed || entry.services.contains("t3"),
+                "consent needs a t3 grant"
+            );
+            entry.bridge_consent = allowed;
+            Ok(())
+        })
+    }
+
+    /// The peer may broker this device's T3 right now: consent and `t3`.
+    pub fn bridge_consented(&self, peer: &str) -> Result<bool> {
+        let _lock = self.lock()?;
+        Ok(self
+            .read()?
+            .peers
+            .get(peer)
+            .is_some_and(|p| p.bridge_consent && p.services.contains("t3")))
+    }
+
+    /// The peer may ask this bridge for every consenting host right now.
+    pub fn all_hosts_allowed(&self, peer: &str) -> Result<bool> {
+        let _lock = self.lock()?;
+        Ok(self
+            .read()?
+            .peers
+            .get(peer)
+            .is_some_and(|p| p.all_hosts && p.services.contains("t3")))
     }
 
     /// Applies a paired device's announcement of its name, whether it lets this
@@ -536,9 +621,33 @@ impl Store {
         })
     }
     pub fn create_invite(&self, services: &[String], ttl: Duration, now: u64) -> Result<String> {
+        self.new_invite(services, ttl, now, false)
+    }
+
+    /// An invitation whose approval also gives every host that consented.
+    pub fn create_all_hosts_invite(
+        &self,
+        services: &[String],
+        ttl: Duration,
+        now: u64,
+    ) -> Result<String> {
+        self.new_invite(services, ttl, now, true)
+    }
+
+    fn new_invite(
+        &self,
+        services: &[String],
+        ttl: Duration,
+        now: u64,
+        all_hosts: bool,
+    ) -> Result<String> {
         ensure!(
             !services.is_empty() && services.iter().all(|s| valid_service(s)),
             "invalid service grant"
+        );
+        ensure!(
+            !all_hosts || services.iter().any(|s| s == "t3"),
+            "an all-hosts invitation needs the t3 service"
         );
         ensure!(
             (1..=3600).contains(&ttl.as_secs()),
@@ -556,6 +665,7 @@ impl Store {
                     services: services.iter().cloned().collect(),
                     pending: None,
                     approved: false,
+                    all_hosts,
                 },
             );
             Ok(())
@@ -580,6 +690,7 @@ impl Store {
                 let grant = state.peers.get(peer).context("membership unavailable")?;
                 return Ok(PairDecision::Approved {
                     services: grant.services.iter().cloned().collect(),
+                    all_hosts: grant.all_hosts,
                 });
             }
             if invite.pending.is_none() {
@@ -635,21 +746,14 @@ impl Store {
             if let Some(existing) = state.peers.get_mut(peer) {
                 // Reciprocal enrollment changes inbound rights, never the learned outbound route.
                 existing.services = invite.services.clone();
+                existing.all_hosts = invite.all_hosts;
+                existing.drop_t3_rights();
             } else {
                 state.peers.insert(
                     peer.to_owned(),
                     Peer {
-                        id: peer.to_owned(),
-                        name: name.clone(),
-                        services: invite.services.clone(),
-                        remote_services: BTreeSet::new(),
-                        address: None,
-                        public: BTreeSet::new(),
-                        remote_public: BTreeSet::new(),
-                        admin: false,
-                        managed: false,
-                        gateway_routes: Vec::new(),
-                        routes_updated: 0,
+                        all_hosts: invite.all_hosts,
+                        ..Peer::new(peer.to_owned(), name.clone(), invite.services.clone())
                     },
                 );
             }
