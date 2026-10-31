@@ -98,22 +98,29 @@ must keep the target unsendable until its uploads/grants are verified.
   watch replay is frozen at the first page's snapshot, so subsequent edits are
   returned on the next poll. Two items per page keep even transfer events bounded.
 
-Cursors and revisions are opaque strings. Wrong-owner, malformed or future cursors
-return `draft_snapshot_required`. History is retained for the lifetime of this
-store, so valid old cursors do not expire. On that error, get a fresh full snapshot
-before replaying offline writes; retain each original base revision/local branch.
-A full snapshot must not reset unsynced edits' expected revisions to the latest.
+Revisions are opaque strings. Cursors have the form `<owner>:<sequence>`; use
+the numeric component only to anchor a mutation ID, never to merge edits.
+Wrong-owner, malformed or future cursors
+return `draft_snapshot_required`. Cursors below the persisted compaction floor return
+`draft_resync_required`. On either recovery error, fetch every page of a fresh
+full snapshot. Keep the original base revision, command/ID and local branch for
+**every** unsynced edit. If its original cursor is below the floor, reconcile that
+branch as an explicit local conflict against the snapshot (including absence).
+Do not automatically send it, rebase its ID/cursor or reset its expected revision.
+A missing key might have been deleted while the device was offline. Only explicit
+user resolution may create a new mutation using the fresh snapshot cursor. This
+also applies to offline create-if-absent and uncertain mutation outcomes.
 
 ## Conditional writes and receipts
 
 ```json
-{"op":"put","scope":S,"expected":null,"mutationId":"<durable-uuid>","payload":P}
+{"op":"put","scope":S,"expected":null,"baseCursor":"<owner>:<sequence>","mutationId":"<sequence>.<durable-uuid>","payload":P}
 ```
 
 Null means **create if absent**, not overwrite. Updates supply the last observed
 `document.revision` as `expected`. Every stored document is
 `{scope,revision,deleted,payload}`. A delete uses
-`{op:"delete",scope:S,expected:R,mutationId:M}` and commits a tombstone with null
+`{op:"delete",scope:S,expected:R,baseCursor:C,mutationId:M}` and commits a tombstone with null
 payload. A stale create/edit cannot resurrect it. Intentional restoration can
 CAS against the tombstone's current revision.
 
@@ -125,11 +132,21 @@ no document changes, timestamp ordering, automatic merge or last-writer-wins.
 The client must retain its own branch, surface the conflict, and use a **new**
 mutation ID for a user-resolved operation based on the chosen current revision.
 
-Mutation IDs are scoped by authenticated client endpoint. Before sending, persist
+Mutation IDs are scoped by authenticated client endpoint. New commands must use
+`mutationId:"<sequence>.<durable-uuid>"` and `baseCursor:"<owner>:<sequence>"`,
+where sequence comes from the completed snapshot/watch on which the edit was
+based. Keep both fields unchanged on retry; the ID embeds its original cursor.
+An ID/cursor mismatch returns `draft_mutation_reused`. An expired ID returns
+`draft_resync_required` plus `{status:"conflict",local:<original-command>,floor,
+mutationId}` without applying it. A changed cursor cannot make an old ID reusable.
+Legacy IDs without a cursor have an implicit zero anchor and are rejected after
+the first compaction. This is a required adapter update for long-lived clients.
+Before sending, persist
 the exact command, original expected revision and mutation ID durably. Retry the
 same command after an uncertain outcome, or query
 `{op:"receipt",mutationId:M}`. A known receipt returns the original result; an
-unknown ID returns `{found:false}`. Reusing an ID for changed command fields
+unknown ID returns `{found:false}` before any compaction and
+`draft_resync_required` afterward (absence no longer proves non-application). Reusing an ID for changed command fields
 returns `draft_mutation_reused`. Object key order is normalized by JSON parsing;
 command values must match. A conflict receipt is deduplicated too. Receipt lookup
 and retry remain authorized by the current grant.
@@ -138,7 +155,8 @@ and retry remain authorized by the current grant.
 
 ```json
 {"op":"transfer","scope":SOURCE,"expected":"<source-revision>",
- "target":TARGET,"targetExpected":null,"mutationId":"<durable-uuid>"}
+ "target":TARGET,"targetExpected":null,
+ "baseCursor":"<owner>:<sequence>","mutationId":"<sequence>.<durable-uuid>"}
 ```
 
 For stash, SOURCE is the thread and TARGET is a new stash entry. For restore,
@@ -166,15 +184,27 @@ or application logs. Local clients must likewise omit drafts from diagnostics.
 This is private plaintext state with the same protection as identity state,
 not encryption at rest.
 
-Limits: command 32 KiB, payload 8 KiB, 128 document keys **including tombstones**,
-2048 mutation receipts **including conflicts**, total serialized store 4 MiB.
-Events are bounded by those same mutations; two items per read page. Quota errors
-are `draft_quota` with no partial change. Receipts and tombstones are never silently
-evicted: valid offline bases and unknown outcomes remain safe. This deliberately
-bounded first version eventually becomes read-only at quota and needs an explicit
-future export/compaction protocol with client checkpointing; deleting live drafts
-does not reclaim tombstone/receipt slots. Do not delete the database to reclaim
-space: that would invalidate the offline safety contract.
+Limits: command 32 KiB, payload 8 KiB, **1024 live document keys**, 2048
+retained receipts including conflicts, total serialized store **16 MiB**. Live
+content is never evicted. Exceeding the live-key limit returns `draft_live_limit`;
+byte quota failure returns `draft_quota`. Neither applies a partial transaction.
+Deletes remain available at the live cap, and transfers count their net live-key
+change (source deletion can make room for the target or backup).
+
+Every authorized operation checks retention under the existing state lock. After
+30 days, the oldest expired transaction prefix is compacted. Receipt/byte pressure
+can compact the oldest retained prefix sooner. Compaction removes receipts,
+events and tombstones in that prefix together and persists a monotonically
+increasing cursor floor in the same atomic file. No tombstone disappears without
+invalidating older cursors and mutation IDs. Conflict receipts also have sequence
+and retention metadata. List pagination is invalidated when compaction changes a
+snapshot. Already-present receipts still deduplicate exact retries; compacted IDs
+never apply again. Receipt lookup after compaction conservatively requires resync
+when unknown. No background service or wall-clock sleeps are needed: the next
+operation performs maintenance. Tests can inject a shared atomic draft clock via
+`Store::with_drafts_clock`, independent of pairing/authorization time. Existing
+stores acquire retention timestamps on first access; existing receipts remain
+usable until their prefix is compacted. Never delete the database to reclaim space.
 
 ## Exact Desktop integration
 
@@ -185,7 +215,9 @@ space: that would invalidate the offline safety contract.
    `T3Composer.qml` with `manage action:drafts` (use `peer` for another bridge).
    Map local environment aliases to the real source environment UUID first.
    Keep a private local journal of base revision, local content/edit generation,
-   exact mutation JSON/ID and resume cursor before issuing writes.
+   exact mutation JSON/anchored ID and resume cursor before issuing writes.
+   Handle `draft_resync_required` by fetching a full snapshot and retaining each
+   unsynced branch as a local conflict, even when its key is absent.
 3. Import legacy draft files and prompt stash create-if-absent. Preserve files
    until acknowledged; on conflict retain both and ask the user to resolve it.
    Do not blindly overwrite shared content on first run.
@@ -214,7 +246,9 @@ space: that would invalidate the offline safety contract.
 3. Add a shared repository alongside Room's `DraftRepository`: persist pending
    command/base revision/local branch/mutation ID and cursor in a Room transaction
    before network I/O. Import Room rows create-if-absent, retaining conflicts.
-   Consume snapshot/watch before replaying conditional offline commands; query
+   Consume snapshot/watch before replaying conditional offline commands; on
+   `draft_resync_required`, preserve all unsynced branches as local conflicts and
+   require explicit resolution with a new anchored ID. Query
    receipts or retry unchanged IDs for unknown outcomes.
 4. Inject that repository into the exported composer VM/screen. Persist model and
    delivery preferences in the payload, keep local URI/outbox state private,

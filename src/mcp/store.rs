@@ -1070,6 +1070,7 @@ impl GatewayStore {
             "absolute device state required"
         );
         let device = crate::Store {
+            drafts_clock: None,
             root: binding.device_state.clone(),
         };
         ensure!(
@@ -1133,6 +1134,7 @@ impl GatewayStore {
     pub fn catalog_allows(&self, environment: &str) -> Result<bool> {
         if let Some(binding) = self.remote_catalog_binding()? {
             let device = crate::Store {
+                drafts_clock: None,
                 root: binding.device_state,
             };
             let Some(address) = device
@@ -1161,6 +1163,7 @@ impl GatewayStore {
         }
         let binding: CatalogBinding = serde_json::from_slice(&read_private(&path)?)?;
         let device = crate::Store {
+            drafts_clock: None,
             root: binding.device_state.clone(),
         };
         if !device.authorized(&binding.client_id, "t3")? {

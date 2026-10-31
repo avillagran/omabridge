@@ -71,6 +71,7 @@ impl RuntimeReservation {
 #[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
+    drafts_clock: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -343,6 +344,20 @@ pub enum PairDecision {
 }
 
 impl Store {
+    /// Override only the draft retention clock, shared by clones (for deterministic labs).
+    pub fn with_drafts_clock(
+        mut self,
+        clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.drafts_clock = Some(clock);
+        self
+    }
+    pub(crate) fn drafts_now(&self) -> Result<u64> {
+        self.drafts_clock.as_ref().map_or_else(unix_time, |c| {
+            Ok(c.load(std::sync::atomic::Ordering::SeqCst))
+        })
+    }
+
     pub fn snapshot(&self) -> Result<DeviceSnapshot> {
         let _lock = self.lock()?;
         let State {
@@ -799,6 +814,7 @@ impl Store {
             "state directory must be a private non-symlink directory (0700)"
         );
         let store = Self {
+            drafts_clock: None,
             root: path.to_path_buf(),
         };
         let lock = store.lock()?;

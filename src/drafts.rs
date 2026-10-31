@@ -14,20 +14,27 @@ use std::{
 
 pub const SERVICE: &str = "drafts";
 pub const MAX_DOCUMENT: usize = 8192;
-const MAX_BYTES: usize = 4 * 1024 * 1024;
-const MAX_DOCUMENTS: usize = 128; // Includes tombstones: never silently evicted.
-const MAX_MUTATIONS: usize = 2048; // Receipts and events are retained, not time-expired.
+const MAX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DOCUMENTS: usize = 1024; // Live documents only.
+const MAX_MUTATIONS: usize = 2048;
+const RETENTION: u64 = 30 * 24 * 60 * 60;
 const PAGE: usize = 2;
 
 #[derive(Default, Serialize, Deserialize)]
 struct Database {
     sequence: u64,
+    #[serde(default)]
+    floor: u64,
+    #[serde(default)]
+    times: BTreeMap<u64, u64>,
     documents: BTreeMap<String, Value>,
     receipts: BTreeMap<String, Receipt>,
     events: Vec<Value>,
 }
 #[derive(Serialize, Deserialize)]
 struct Receipt {
+    #[serde(default)]
+    sequence: u64,
     hash: String,
     outcome: Value,
 }
@@ -173,7 +180,12 @@ fn save(store: &Store, db: &Database) -> Result<()> {
     let bytes = serde_json::to_vec(db)?;
     ensure!(
         bytes.len() <= MAX_BYTES
-            && db.documents.len() <= MAX_DOCUMENTS
+            && db
+                .documents
+                .values()
+                .filter(|d| d["deleted"] != true)
+                .count()
+                <= MAX_DOCUMENTS
             && db.receipts.len() <= MAX_MUTATIONS,
         "draft_quota"
     );
@@ -198,6 +210,24 @@ fn save(store: &Store, db: &Database) -> Result<()> {
     result
 }
 
+// Discard a contiguous prefix. A persisted floor invalidates every dependent
+// cursor and mutation before any tombstone or dedupe information disappears.
+fn compact(db: &mut Database, floor: u64) {
+    db.floor = db.floor.max(floor);
+    db.receipts.retain(|_, r| r.sequence > db.floor);
+    db.events
+        .retain(|e| e["sequence"].as_u64().unwrap_or(0) > db.floor);
+    db.documents.retain(|_, d| {
+        d["deleted"] != true
+            || d["revision"]
+                .as_str()
+                .and_then(|r| r.rsplit(':').next()?.parse::<u64>().ok())
+                .unwrap_or(0)
+                > db.floor
+    });
+    db.times.retain(|s, _| *s > db.floor);
+}
+
 /// `peer=None` is the local owner. Remote access needs a current explicit drafts
 /// service grant, independent of manage/T3/all-hosts privileges.
 pub fn execute(store: &Store, peer: Option<&str>, request: &Value) -> Value {
@@ -207,6 +237,8 @@ pub fn execute(store: &Store, peer: Option<&str>, request: &Value) -> Value {
             let message = e.to_string();
             let code = [
                 "draft_invalid",
+                "draft_live_limit",
+                "draft_resync_required",
                 "draft_attachment_host",
                 "draft_snapshot_required",
                 "draft_forbidden",
@@ -235,19 +267,58 @@ fn run(store: &Store, peer: Option<&str>, r: &Value) -> Result<Value> {
     }
     ensure!(serde_json::to_vec(r)?.len() <= 32 * 1024, "draft_invalid");
     let mut db = load(store)?;
+    let now = store.drafts_now()?;
+    // Old stores have no retention metadata; start their retention window now.
+    let migrated = db.times.is_empty() && (db.sequence > db.floor || !db.receipts.is_empty());
+    if migrated {
+        if db.sequence == db.floor {
+            db.sequence = db.sequence.checked_add(1).context("draft_quota")?;
+        }
+        db.times.insert(db.sequence, now);
+        for receipt in db.receipts.values_mut() {
+            receipt.sequence = db.sequence;
+        }
+    }
+    let expired = db
+        .times
+        .iter()
+        .filter(|(_, t)| now.saturating_sub(**t) >= RETENTION)
+        .map(|(s, _)| *s)
+        .max()
+        .unwrap_or(db.floor);
+    let pressure = db.receipts.len() >= MAX_MUTATIONS - 1
+        || serde_json::to_vec(&db)?.len() > MAX_BYTES - 128 * 1024;
+    let floor = if pressure { db.sequence } else { expired };
+    if floor > db.floor {
+        compact(&mut db, floor);
+        // Invalidate list pagination even when only retention changed the snapshot.
+        db.sequence = db.sequence.checked_add(1).context("draft_quota")?;
+        save(store, &db)?;
+    } else if migrated {
+        save(store, &db)?;
+    }
+
     let op = r["op"].as_str().context("draft_invalid")?;
     let allowed: &[&str] = match op {
         "list" => &["op", "offset", "snapshot"],
         "watch" => &["op", "cursor", "offset", "snapshot"],
         "get" => &["op", "scope"],
         "receipt" => &["op", "mutationId"],
-        "put" => &["op", "scope", "expected", "mutationId", "payload"],
-        "delete" => &["op", "scope", "expected", "mutationId"],
+        "put" => &[
+            "op",
+            "scope",
+            "expected",
+            "baseCursor",
+            "mutationId",
+            "payload",
+        ],
+        "delete" => &["op", "scope", "expected", "baseCursor", "mutationId"],
         "transfer" => &[
             "op",
             "scope",
             "expected",
             "mutationId",
+            "baseCursor",
             "target",
             "targetExpected",
             "backup",
@@ -266,6 +337,7 @@ fn run(store: &Store, peer: Option<&str>, r: &Value) -> Result<Value> {
         } else {
             0
         };
+        ensure!(op != "watch" || since >= db.floor, "draft_resync_required");
         // Snapshot pagination must restart if any commit occurred between pages.
         if op == "list" && r.get("snapshot").is_some() {
             ensure!(
@@ -278,6 +350,7 @@ fn run(store: &Store, peer: Option<&str>, r: &Value) -> Result<Value> {
         } else {
             db.sequence
         };
+        ensure!(op != "watch" || fence >= db.floor, "draft_resync_required");
         ensure!(fence >= since, "draft_snapshot_required");
         let offset = r["offset"].as_u64().unwrap_or(0) as usize;
         ensure!(
@@ -316,14 +389,36 @@ fn run(store: &Store, peer: Option<&str>, r: &Value) -> Result<Value> {
             .receipts
             .get(&receipt_key)
             .map(|r| r.outcome.clone())
-            .unwrap_or(json!({"found":false})));
+            .unwrap_or(if db.floor > 0 {
+                json!({"error":"draft_resync_required"})
+            } else {
+                json!({"found":false})
+            }));
     }
     let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(r)?));
     if let Some(receipt) = db.receipts.get(&receipt_key) {
         ensure!(receipt.hash == hash, "draft_mutation_reused");
         return Ok(receipt.outcome.clone());
     }
-    ensure!(db.receipts.len() < MAX_MUTATIONS, "draft_quota");
+    let base = match r.get("baseCursor") {
+        Some(c) => cursor(&owner, c, db.sequence)?,
+        None => 0,
+    };
+    // The cursor is part of the durable ID, not a retry field that can be
+    // refreshed. Legacy UUIDs have an implicit zero anchor and expire together.
+    let anchor = mutation
+        .split_once('.')
+        .and_then(|(s, _)| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    ensure!(anchor == base, "draft_mutation_reused");
+    if anchor < db.floor {
+        return Ok(
+            json!({"error":"draft_resync_required","status":"conflict","local":r,
+            "floor":revision(&owner, db.floor),"mutationId":mutation}),
+        );
+    }
+    db.sequence = db.sequence.checked_add(1).context("draft_quota")?;
+    db.times.insert(db.sequence, now);
     ensure!(["put", "delete", "transfer"].contains(&op), "draft_invalid");
     let scope = &r["scope"];
     let k = key(scope)?;
@@ -377,7 +472,6 @@ fn run(store: &Store, peer: Option<&str>, r: &Value) -> Result<Value> {
         // The durable receipt retains the local branch and latest server content.
         json!({"status":"conflict","mutationId":mutation,"local":r,"conflicts":conflicts})
     } else {
-        db.sequence = db.sequence.checked_add(1).context("draft_quota")?;
         let rev = revision(&owner, db.sequence);
         let mut changes = Vec::new();
         if op == "transfer" {
@@ -410,10 +504,24 @@ fn run(store: &Store, peer: Option<&str>, r: &Value) -> Result<Value> {
     db.receipts.insert(
         receipt_key,
         Receipt {
+            sequence: db.sequence,
             hash,
             outcome: outcome.clone(),
         },
     );
+    ensure!(
+        db.documents
+            .values()
+            .filter(|d| d["deleted"] != true)
+            .count()
+            <= MAX_DOCUMENTS,
+        "draft_live_limit"
+    );
+    if serde_json::to_vec(&db)?.len() > MAX_BYTES {
+        // Preserve this transaction's receipt; compact only the preceding prefix.
+        let floor = db.sequence - 1;
+        compact(&mut db, floor);
+    }
     save(store, &db)?;
     Ok(outcome)
 }
@@ -430,53 +538,67 @@ mod tests {
         json!({"op":"put","scope":scope(id),"expected":null,"mutationId":mutation,"payload":{"schema":1,"text":"private","attachments":[]}})
     }
     #[test]
-    fn quota_failure_does_not_partially_transfer_or_discard_tombstones() -> Result<()> {
+    fn oversized_commit_is_atomic() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("state"), "owner")?;
-        let mut db = Database::default();
-        for i in 0..MAX_DOCUMENTS {
-            let scope = scope(&format!("t{i}"));
-            db.documents.insert(key(&scope)?,json!({"scope":scope,"revision":"base","deleted":i>1,"payload":{"schema":1,"text":"preserve","attachments":[]}}));
-        }
-        save(&store, &db)?;
+        assert_eq!(execute(&store, None, &put("t", "m"))["status"], "applied");
         let before = fs::read(store.root().join("shared-drafts.json"))?;
-        let request = json!({"op":"transfer","scope":scope("t0"),"expected":"base","target":scope("t1"),"targetExpected":"base","backup":{"environment":"env","project":"project","kind":"stash","id":"backup"},"mutationId":"full"});
-        assert_eq!(execute(&store, None, &request)["error"], "draft_quota");
-        assert_eq!(fs::read(store.root().join("shared-drafts.json"))?, before);
-        assert_eq!(
-            execute(&store, None, &put("extra", "extra"))["error"],
-            "draft_quota"
-        );
-        Ok(())
-    }
-    #[test]
-    fn receipt_and_byte_quotas_fail_closed_without_expiring_dedupe() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let store = Store::open(&dir.path().join("state"), "owner")?;
-        let first = put("t", "first");
-        let receipt = execute(&store, None, &first);
         let mut db = load(&store)?;
-        for i in 1..MAX_MUTATIONS {
-            db.receipts.insert(
-                format!("filler-{i}"),
-                Receipt {
-                    hash: "hash".into(),
-                    outcome: json!({"status":"applied"}),
-                },
-            );
-        }
-        save(&store, &db)?;
-        assert_eq!(execute(&store, None, &first), receipt);
-        assert_eq!(
-            execute(&store, None, &put("new", "new"))["error"],
-            "draft_quota"
-        );
-        let before = fs::read(store.root().join("shared-drafts.json"))?;
-        db.events.push(json!({"tooBig":"x".repeat(MAX_BYTES)}));
+        db.events.push(json!({"oversized":"x".repeat(MAX_BYTES)}));
         assert_eq!(save(&store, &db).unwrap_err().to_string(), "draft_quota");
         assert_eq!(fs::read(store.root().join("shared-drafts.json"))?, before);
         Ok(())
     }
+
+    #[test]
+    fn legacy_retention_clock_is_persisted_and_snapshot_pages_expire() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        let dir = tempfile::tempdir()?;
+        let clock = Arc::new(AtomicU64::new(100));
+        let store =
+            Store::open(&dir.path().join("state"), "owner")?.with_drafts_clock(clock.clone());
+        let saved = execute(&store, None, &put("t", "m"));
+        let deleted = execute(
+            &store,
+            None,
+            &json!({"op":"delete","scope":scope("t"),"expected":saved["event"]["revision"],"mutationId":"delete"}),
+        );
+        let mut db = load(&store)?;
+        db.times.clear();
+        for r in db.receipts.values_mut() {
+            r.sequence = 0;
+        }
+        save(&store, &db)?;
+        let page = execute(&store, None, &json!({"op":"list"}));
+        assert_eq!(load(&store)?.times.values().next(), Some(&100));
+        clock.store(100 + RETENTION, Ordering::SeqCst);
+        assert_eq!(
+            execute(
+                &store,
+                None,
+                &json!({"op":"list","snapshot":page["cursor"],"offset":0})
+            )["error"],
+            "draft_snapshot_required"
+        );
+        assert_eq!(
+            execute(
+                &store,
+                None,
+                &json!({"op":"watch","cursor":saved["event"]["revision"]})
+            )["error"],
+            "draft_resync_required"
+        );
+        assert!(load(&store)?.documents.is_empty());
+        assert_eq!(
+            load(&store)?.floor,
+            deleted["event"]["sequence"].as_u64().unwrap()
+        );
+        Ok(())
+    }
+
     #[test]
     fn private_regular_state_only_and_no_runtime_payloads() -> Result<()> {
         let dir = tempfile::tempdir()?;

@@ -6,6 +6,7 @@ use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, time::Duration};
 struct Lab {
     _dir: tempfile::TempDir,
     owner: Store,
+    clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
     a_store: Store,
     b_store: Store,
     node: Node,
@@ -15,7 +16,9 @@ struct Lab {
 impl Lab {
     async fn new() -> Result<Self> {
         let dir = tempfile::tempdir()?;
-        let owner = Store::open(&dir.path().join("bridge"), "bridge")?;
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_800_000_000));
+        let owner =
+            Store::open(&dir.path().join("bridge"), "bridge")?.with_drafts_clock(clock.clone());
         let a_store = Store::open(&dir.path().join("phone"), "phone")?;
         let b_store = Store::open(&dir.path().join("desktop"), "desktop")?;
         let node = Node::start(
@@ -54,6 +57,7 @@ impl Lab {
         Ok(Self {
             _dir: dir,
             owner,
+            clock,
             a_store,
             b_store,
             node,
@@ -84,6 +88,16 @@ fn put(id: &str, mutation: &str, expected: Value, text: &str) -> Value {
 }
 fn rev(v: &Value) -> Value {
     v["event"]["revision"].clone()
+}
+
+fn anchored(mut request: Value, cursor: Value) -> Value {
+    let sequence = cursor.as_str().unwrap().rsplit(':').next().unwrap();
+    request["mutationId"] = json!(format!(
+        "{sequence}.{}",
+        request["mutationId"].as_str().unwrap()
+    ));
+    request["baseCursor"] = cursor;
+    request
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -379,6 +393,139 @@ async fn desktop_manage_uses_serving_identity_control_socket_for_remote_drafts()
         1
     );
     desktop_node.shutdown().await;
+    lab.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn thousands_of_cycles_compact_and_offline_edits_require_reconciliation() -> Result<()> {
+    let lab = Lab::new().await?;
+    let original = put("offline", "original", Value::Null, "saved");
+    let saved = lab.call(false, original.clone()).await?;
+    let offline = put(
+        "offline",
+        "offline-edit",
+        rev(&saved),
+        "unsynced local edit",
+    );
+    let deleted = lab.call(true, json!({"op":"delete","scope":scope("offline"),"expected":rev(&saved),"mutationId":"deleted"})).await?;
+    let old_cursor = rev(&deleted);
+    for i in 0..2200 {
+        let cycle = format!("cycle-{i}");
+        // First half exercises receipt pressure; second half exercises retention.
+        if i >= 1100 {
+            lab.clock
+                .fetch_add(86400, std::sync::atomic::Ordering::SeqCst);
+        }
+        let snapshot = lab.call(false, json!({"op":"list"})).await?;
+        let mut create = put(&cycle, &format!("create-{i}"), Value::Null, "draft");
+        create = anchored(create, snapshot["cursor"].clone());
+        // A retained tombstone must be explicitly restored.
+        let current = lab
+            .call(false, json!({"op":"get","scope":scope(&cycle)}))
+            .await?;
+        if !current["document"].is_null() {
+            create["expected"] = current["document"]["revision"].clone();
+        }
+        let created = lab.call(false, create).await?;
+        assert_eq!(created["status"], "applied", "{created}");
+        let result = lab.call(false, anchored(json!({"op":"delete","scope":scope(&cycle),"expected":rev(&created),"mutationId":format!("delete-{i}")}), rev(&created))).await?;
+        assert_eq!(result["status"], "applied", "{result}");
+    }
+    assert_eq!(
+        lab.call(true, json!({"op":"watch","cursor":old_cursor}))
+            .await?["error"],
+        "draft_resync_required"
+    );
+    let mut snapshot = lab.call(true, json!({"op":"list"})).await?;
+    while !snapshot["nextOffset"].is_null() {
+        let page = lab
+            .call(
+                true,
+                json!({"op":"list","snapshot":snapshot["cursor"],"offset":snapshot["nextOffset"]}),
+            )
+            .await?;
+        snapshot["items"]
+            .as_array_mut()
+            .unwrap()
+            .extend(page["items"].as_array().unwrap().clone());
+        snapshot["nextOffset"] = page["nextOffset"].clone();
+    }
+    assert!(
+        snapshot["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["scope"]["id"] != "offline")
+    );
+    let conflict = lab.call(false, offline.clone()).await?;
+    assert_eq!(conflict["error"], "draft_resync_required");
+    assert_eq!(conflict["local"], offline); // Local journal must surface this branch as a conflict.
+    let mut rebased_replay = original.clone();
+    rebased_replay["baseCursor"] = snapshot["cursor"].clone();
+    assert_eq!(
+        lab.call(false, rebased_replay).await?["error"],
+        "draft_mutation_reused"
+    );
+    assert_eq!(
+        lab.call(false, original).await?["error"],
+        "draft_resync_required"
+    );
+    assert!(
+        lab.call(false, json!({"op":"get","scope":scope("offline")}))
+            .await?["document"]
+            .is_null()
+    );
+    let mut resolved = put("resolved", "resolved", Value::Null, "unsynced local edit");
+    resolved = anchored(resolved, snapshot["cursor"].clone());
+    assert_eq!(lab.call(false, resolved).await?["status"], "applied");
+    let reopened = Store::open(lab.owner.root(), "bridge")?.with_drafts_clock(lab.clock.clone());
+    assert_eq!(
+        omabridge::drafts::execute(&reopened, None, &json!({"op":"watch","cursor":old_cursor}))["error"],
+        "draft_resync_required"
+    );
+    assert!(
+        std::fs::metadata(lab.owner.root().join("shared-drafts.json"))?.len() < 2 * 1024 * 1024
+    );
+    lab.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_cap_rejects_atomically_but_allows_delete_and_replacement() -> Result<()> {
+    let lab = Lab::new().await?;
+    let mut first = Value::Null;
+    let mut cursor = lab.call(false, json!({"op":"list"})).await?["cursor"].clone();
+    for i in 0..1024 {
+        let mut request = put(&format!("t{i}"), &format!("m{i}"), Value::Null, "draft");
+        request = anchored(request, cursor.clone());
+        let result = lab.call(false, request).await?;
+        assert_eq!(result["status"], "applied", "{result}");
+        cursor = rev(&result);
+        if i == 0 {
+            first = cursor.clone();
+        }
+    }
+    let before = std::fs::read(lab.owner.root().join("shared-drafts.json"))?;
+    let mut extra = put("extra", "extra", Value::Null, "draft");
+    extra = anchored(extra, cursor.clone());
+    assert_eq!(
+        lab.call(false, extra.clone()).await?["error"],
+        "draft_live_limit"
+    );
+    assert_eq!(
+        std::fs::read(lab.owner.root().join("shared-drafts.json"))?,
+        before
+    );
+    let transfer = json!({"op":"transfer","scope":scope("t0"),"expected":first,"target":scope("t1"),"targetExpected":format!("{}:2",lab.owner.id()?),"backup":{"environment":"source-host-uuid","project":"project-uuid","kind":"stash","id":"backup"},"mutationId":"transfer-cap","baseCursor":cursor});
+    // This move plus backup has no net live growth and must succeed at the cap.
+    let moved = lab.call(false, anchored(transfer, cursor.clone())).await?;
+    assert_eq!(moved["status"], "applied", "{moved}");
+    let deleted = lab.call(false, anchored(json!({"op":"delete","scope":scope("t2"),"expected":format!("{}:3",lab.owner.id()?),"mutationId":"delete-cap"}), rev(&moved))).await?;
+    assert_eq!(deleted["status"], "applied");
+    extra = put("extra", "extra-after-delete", Value::Null, "draft");
+    extra = anchored(extra, rev(&deleted));
+    assert_eq!(lab.call(false, extra).await?["status"], "applied");
     lab.stop().await;
     Ok(())
 }
