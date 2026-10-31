@@ -23,6 +23,9 @@ use tokio::{
 const ALPN: &[u8] = b"omabridge/service/1";
 const HEADER_LIMIT: usize = 64 * 1024;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(8);
+/// A pairing through a bridge waits for two dials and the host's T3 CLI.
+const UPSTREAM_PAIR_TIMEOUT: Duration = Duration::from_secs(25);
+const HOST_PAIR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How a device reaches peers it cannot dial directly, e.g. behind NAT or a private IP.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -187,6 +190,12 @@ enum Request {
         grants: Option<Grants>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         routes: Option<Vec<crate::routes::ServiceRoute>>,
+        /// The sender lets the receiver invite devices with full access to it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        bridge_consent: bool,
+        /// Routes to the sender's own T3, given only with that consent.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        host_routes: Vec<crate::routes::ServiceRoute>,
     },
     /// One `omabridge manage` command from a device this one lets manage it.
     Manage {
@@ -194,6 +203,16 @@ enum Request {
     },
     /// A one-use native T3 pairing for a device this one shares `t3` with.
     T3Pair,
+    /// To the selected bridge, from a device it approved for all hosts: a one-use
+    /// native T3 pairing for an environment of its catalog. Also renews.
+    T3HostPair {
+        environment_id: String,
+    },
+    /// From a bridge to a host that gave it `bridge_consent`, for `client_id`.
+    T3DelegatedPair {
+        environment_id: String,
+        client_id: String,
+    },
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
@@ -220,11 +239,20 @@ enum Response {
         grants: Option<Grants>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         routes: Option<Vec<crate::routes::ServiceRoute>>,
+        /// The sender lets the receiver invite devices with full access to it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        bridge_consent: bool,
+        /// Routes to the sender's own T3, given only with that consent.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        host_routes: Vec<crate::routes::ServiceRoute>,
     },
     Managed {
         outcome: serde_json::Value,
     },
     T3Pairing {
+        pairing: crate::t3_pair::T3Pairing,
+    },
+    T3HostPairing {
         pairing: crate::t3_pair::T3Pairing,
     },
 }
@@ -284,14 +312,24 @@ async fn request(
     endpoint: &Endpoint,
     options: &NetOptions,
     addr: &EndpointAddr,
+    message: &Request,
+) -> Result<(Pipe, Response)> {
+    request_within(endpoint, options, addr, message, SETUP_TIMEOUT).await
+}
+
+async fn request_within(
+    endpoint: &Endpoint,
+    options: &NetOptions,
+    addr: &EndpointAddr,
     request: &Request,
+    deadline: Duration,
 ) -> Result<(Pipe, Response)> {
     let address = options.address(addr);
     ensure!(
         !address.addrs.is_empty(),
         "no route allowed by local relay policy"
     );
-    timeout(SETUP_TIMEOUT, async {
+    timeout(deadline, async {
         let connection = endpoint.connect(address, ALPN).await?;
         let (mut send, mut recv) = connection.open_bi().await?;
         write_header(&mut send, request).await?;
@@ -329,6 +367,8 @@ async fn hello(
             admin: peer.admin,
             grants: Some(Grants::of(peer)),
             routes: Some(crate::routes::for_peer(store, &peer.id)),
+            bridge_consent: peer.bridge_consent,
+            host_routes: crate::routes::own_for_peer(store, peer),
         },
     )
     .await?;
@@ -339,6 +379,8 @@ async fn hello(
             admin,
             grants,
             routes,
+            bridge_consent,
+            host_routes,
         } => {
             ensure!(address.id == addr.id, "peer answered for another device");
             store.refresh_peer(
@@ -351,6 +393,7 @@ async fn hello(
             if let Some(routes) = routes {
                 store.refresh_routes(&peer.id, &routes, unix_time()?)?;
             }
+            store.refresh_host(&peer.id, bridge_consent, &host_routes)?;
             Ok(())
         }
         _ => bail!("peer refused the announcement"),
@@ -398,8 +441,9 @@ async fn hello_all(
 }
 
 /// What an announcement depends on: this device's name, the paired devices it
-/// can dial, which of them may manage it and what each may reach.
-type SyncEntry = (String, bool, Vec<String>, Vec<String>);
+/// can dial, which of them may manage it, what each may reach and which may
+/// invite devices with full access.
+type SyncEntry = (String, bool, bool, Vec<String>, Vec<String>);
 
 fn sync_key(store: &Store) -> Option<(String, Vec<SyncEntry>, Vec<crate::gateway::Gateway>)> {
     let mut reachable: Vec<SyncEntry> = store
@@ -411,6 +455,7 @@ fn sync_key(store: &Store) -> Option<(String, Vec<SyncEntry>, Vec<crate::gateway
             (
                 peer.id,
                 peer.admin,
+                peer.bridge_consent,
                 peer.services.into_iter().collect(),
                 peer.public.into_iter().collect(),
             )
@@ -575,8 +620,11 @@ async fn control_request(
         };
         return match pair_with(endpoint, options, store, &invite, &name, now).await {
             Ok(PairDecision::Pending) => json!({ "status": "pending" }),
-            Ok(PairDecision::Approved { services }) => {
-                json!({ "status": "approved", "services": services })
+            Ok(PairDecision::Approved {
+                services,
+                all_hosts,
+            }) => {
+                json!({ "status": "approved", "services": services, "allHosts": all_hosts })
             }
             Err(error) => {
                 let message = format!("{error:#}");
@@ -854,6 +902,118 @@ async fn t3_pair_with(
         _ => bail!("omabridge_t3_pair_unavailable"),
     }
 }
+/// Asks a host, as its consented bridge, to pair `client` for `environment`.
+async fn t3_delegated_pair_with(
+    endpoint: &Endpoint,
+    options: &NetOptions,
+    addr: &EndpointAddr,
+    client: &str,
+    environment: &str,
+) -> Result<crate::t3_pair::T3Pairing> {
+    let (_pipe, response) = request_within(
+        endpoint,
+        options,
+        addr,
+        &Request::T3DelegatedPair {
+            environment_id: environment.into(),
+            client_id: client.into(),
+        },
+        UPSTREAM_PAIR_TIMEOUT,
+    )
+    .await?;
+    let Response::T3HostPairing { pairing } = response else {
+        bail!("delegated pairing refused");
+    };
+    pairing.validate()?;
+    ensure!(
+        pairing.environment_id == environment
+            && pairing.label == crate::t3_pair::delegated_label(&endpoint.id().to_string(), client),
+        "delegated pairing mismatch"
+    );
+    Ok(pairing)
+}
+
+/// Host side of `T3DelegatedPair`. `peer` is the authenticated bridge.
+async fn serve_delegated_pair(
+    store: &Store,
+    services: &ServiceTargets,
+    peer: &str,
+    environment: &str,
+    client: &str,
+) -> Result<crate::t3_pair::T3Pairing> {
+    ensure!(store.bridge_consented(peer)?, "delegated pairing refused");
+    ensure!(
+        client.parse::<iroh::EndpointId>()?.to_string() == client,
+        "invalid client"
+    );
+    let _permit = services.pair_limit.admit(peer)?;
+    let issuer = services
+        .t3_issuer
+        .as_ref()
+        .context("T3 pairing unavailable")?;
+    let target = services.resolve("t3").context("T3 unavailable")?;
+    let pairing = issuer
+        .issue_delegated(target, peer, client, environment)
+        .await?;
+    // Withdrawing consent while T3 was asked keeps the pairing from leaving.
+    ensure!(store.bridge_consented(peer)?, "delegated pairing withdrawn");
+    Ok(pairing)
+}
+
+/// Bridge side of `T3HostPair`. `peer` is the authenticated device: its
+/// all-hosts approval, `t3` grant and catalog entry hold before and after I/O.
+async fn serve_host_pair(
+    store: &Store,
+    services: &ServiceTargets,
+    peer: &str,
+    environment: &str,
+) -> Result<crate::t3_pair::T3Pairing> {
+    let allowed = || -> Result<()> {
+        ensure!(store.all_hosts_allowed(peer)?, "host pairing refused");
+        let manifest = crate::catalog::read_for_peer(store, peer, enrollment_now()?)?;
+        ensure!(
+            manifest["environments"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|e| e["environmentId"] == environment)),
+            "host pairing refused"
+        );
+        Ok(())
+    };
+    allowed()?;
+    let _permit = services.pair_limit.admit(peer)?;
+    let issuer = crate::catalog_publisher::issuer_of(store, environment)?;
+    let pairing = if issuer == store.id()? {
+        // This device's own T3: an ordinary peer pairing, revoked as one.
+        let target = services.resolve("t3").context("T3 unavailable")?;
+        services
+            .t3_issuer
+            .as_ref()
+            .context("T3 pairing unavailable")?
+            .issue(target, peer)
+            .await?
+    } else {
+        ensure!(
+            find_peer(store, &issuer).is_ok_and(|host| host.remote_bridge_consent),
+            "host pairing refused"
+        );
+        let (_, addr) = forward_target(store, &issuer, "t3", None).map_err(anyhow::Error::msg)?;
+        t3_delegated_pair_with(
+            &services.endpoint,
+            &services.options,
+            &addr,
+            peer,
+            environment,
+        )
+        .await?
+    };
+    ensure!(
+        pairing.environment_id == environment,
+        "host pairing mismatch"
+    );
+    allowed()?;
+    Ok(pairing)
+}
+
 fn t3_pair_error(error: &anyhow::Error) -> &'static str {
     let text = format!("{error}");
     [
@@ -1120,8 +1280,12 @@ async fn pair_with(
     .await?;
     match response {
         Response::Pair { decision } => {
-            if let PairDecision::Approved { services } = &decision {
-                store.remember_peer(&invite.address, &invite.name, services)?;
+            if let PairDecision::Approved {
+                services,
+                all_hosts,
+            } = &decision
+            {
+                store.remember_peer(&invite.address, &invite.name, services, *all_hosts)?;
             }
             Ok(decision)
         }
@@ -1358,6 +1522,9 @@ impl Node {
             fixed: services,
             t3_runtime,
             t3_issuer,
+            endpoint: endpoint.clone(),
+            options: options.clone(),
+            pair_limit: crate::t3_pair::PairLimiter::new(),
         });
         let capacity = Arc::new(Semaphore::new(64));
         let open: Arc<std::sync::Mutex<std::collections::HashMap<iroh::EndpointId, usize>>> =
@@ -1458,6 +1625,10 @@ struct ServiceTargets {
     fixed: BTreeMap<String, SocketAddr>,
     t3_runtime: Option<PathBuf>,
     t3_issuer: Option<crate::t3_pair::T3Issuer>,
+    /// A bridge reaches hosts with its own identity while it serves.
+    endpoint: Endpoint,
+    options: NetOptions,
+    pair_limit: crate::t3_pair::PairLimiter,
 }
 
 impl ServiceTargets {
@@ -1602,6 +1773,8 @@ async fn serve_connection(
             admin,
             grants,
             routes,
+            bridge_consent,
+            host_routes,
         } => {
             let refreshed = store.refresh_peer(
                 &peer,
@@ -1614,7 +1787,14 @@ async fn serve_connection(
                 Some(routes) => store.refresh_routes(&peer, &routes, unix_time()?),
                 None => Ok(()),
             });
+            let refreshed =
+                refreshed.and_then(|()| store.refresh_host(&peer, bridge_consent, &host_routes));
             let entry = store.peers()?.into_iter().find(|item| item.id == peer);
+            let consent = entry.as_ref().is_some_and(|item| item.bridge_consent);
+            let own_routes = entry
+                .as_ref()
+                .map(|item| crate::routes::own_for_peer(&store, item))
+                .unwrap_or_default();
             let response = match refreshed {
                 Ok(())
                     if store
@@ -1629,6 +1809,8 @@ async fn serve_connection(
                         admin: true,
                         grants: entry.as_ref().map(Grants::of),
                         routes: Some(crate::routes::for_peer(&store, &peer)),
+                        bridge_consent: consent,
+                        host_routes: own_routes,
                     }
                 }
                 Ok(()) => Response::Hello {
@@ -1637,6 +1819,8 @@ async fn serve_connection(
                     admin: entry.as_ref().is_some_and(|item| item.admin),
                     grants: entry.as_ref().map(Grants::of),
                     routes: Some(crate::routes::for_peer(&store, &peer)),
+                    bridge_consent: consent,
+                    host_routes: own_routes,
                 },
                 Err(_) => Response::Denied,
             };
@@ -1669,6 +1853,30 @@ async fn serve_connection(
             .await;
             let response = match result {
                 Ok(pairing) => Response::T3Pairing { pairing },
+                Err(_) => Response::Denied,
+            };
+            write_header(&mut send, &response).await?;
+            send.finish()?;
+            let _ = timeout(DENIED_LINGER, connection.closed()).await;
+        }
+        Request::T3HostPair { environment_id } => {
+            let result = serve_host_pair(&store, &services, &peer, &environment_id).await;
+            let response = match result {
+                Ok(pairing) => Response::T3HostPairing { pairing },
+                Err(_) => Response::Denied,
+            };
+            write_header(&mut send, &response).await?;
+            send.finish()?;
+            let _ = timeout(DENIED_LINGER, connection.closed()).await;
+        }
+        Request::T3DelegatedPair {
+            environment_id,
+            client_id,
+        } => {
+            let result =
+                serve_delegated_pair(&store, &services, &peer, &environment_id, &client_id).await;
+            let response = match result {
+                Ok(pairing) => Response::T3HostPairing { pairing },
                 Err(_) => Response::Denied,
             };
             write_header(&mut send, &response).await?;
@@ -1860,6 +2068,40 @@ impl Client {
     pub async fn t3_pair(&self, addr: &EndpointAddr) -> Result<crate::t3_pair::T3Pairing> {
         t3_pair_with(&self.endpoint, &self.options, addr).await
     }
+    /// A one-use native T3 pairing for `environment_id` from the bridge `addr`,
+    /// which approved this device for all hosts. Asking again renews a session.
+    pub async fn t3_host_pair(
+        &self,
+        addr: &EndpointAddr,
+        environment_id: &str,
+    ) -> Result<crate::t3_pair::T3Pairing> {
+        let (_pipe, response) = request_within(
+            &self.endpoint,
+            &self.options,
+            addr,
+            &Request::T3HostPair {
+                environment_id: environment_id.into(),
+            },
+            HOST_PAIR_TIMEOUT,
+        )
+        .await
+        .map_err(|_| anyhow::Error::msg("omabridge_host_pair_unavailable"))?;
+        let pairing = match response {
+            Response::T3HostPairing { pairing } => pairing,
+            Response::Denied => bail!("omabridge_host_pair_refused"),
+            _ => bail!("omabridge_host_pair_unavailable"),
+        };
+        pairing.validate()?;
+        let own = self.store.id()?;
+        ensure!(
+            pairing.environment_id == environment_id
+                && (pairing.label == format!("{}{own}", crate::t3_pair::LABEL_PREFIX)
+                    || pairing.label
+                        == crate::t3_pair::delegated_label(&addr.id.to_string(), &own)),
+            "omabridge_host_pair_refused"
+        );
+        Ok(pairing)
+    }
     /// Announces this device's name to every paired device with a known address
     /// and stores their current names and addresses. `own` is this device's
     /// address when it serves. Returns (answered, tried).
@@ -1988,6 +2230,56 @@ mod recovery_tests {
         Ok(())
     }
 
+    #[test]
+    fn hello_stays_compatible_with_older_devices_both_ways() -> Result<()> {
+        let id = iroh::SecretKey::generate().public();
+        let legacy = json_hello(id, "op");
+        let Request::Hello {
+            bridge_consent,
+            host_routes,
+            ..
+        } = serde_json::from_value(legacy)?
+        else {
+            bail!("not a hello");
+        };
+        assert!(!bridge_consent && host_routes.is_empty());
+        let Response::Hello {
+            bridge_consent,
+            host_routes,
+            ..
+        } = serde_json::from_value(json_hello(id, "result"))?
+        else {
+            bail!("not a hello");
+        };
+        assert!(!bridge_consent && host_routes.is_empty());
+        // Nothing new is sent unless there is something to say.
+        let plain = serde_json::to_value(Request::Hello {
+            name: "n".into(),
+            address: None,
+            admin: false,
+            grants: None,
+            routes: None,
+            bridge_consent: false,
+            host_routes: Vec::new(),
+        })?;
+        assert!(plain.get("bridge_consent").is_none() && plain.get("host_routes").is_none());
+        // An older device's parser ignores the additions.
+        #[derive(Deserialize)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        enum LegacyRequest {
+            Hello { name: String },
+        }
+        let LegacyRequest::Hello { name } = serde_json::from_value(serde_json::json!({
+            "op":"hello","name":"n","address":null,"bridge_consent":true,
+            "host_routes":[{"service":"t3","url":"https://h.example.net/"}]}))?;
+        assert_eq!(name, "n");
+        Ok(())
+    }
+
+    fn json_hello(id: iroh::EndpointId, tag: &str) -> serde_json::Value {
+        serde_json::json!({tag:"hello","name":"n","address":EndpointAddr::new(id)})
+    }
+
     #[tokio::test]
     async fn published_t3_follows_runtime_port_and_recovers_after_missing_runtime() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -2078,7 +2370,7 @@ mod recovery_tests {
         let token = owner.create_invite(&["t3".into()], Duration::from_secs(60), now)?;
         owner.claim(&token, &guest.id()?, "guest", now)?;
         owner.approve(&guest.id()?, now)?;
-        guest.remember_peer(&node.addr(), "owner", &["t3".into()])?;
+        guest.remember_peer(&node.addr(), "owner", &["t3".into()], false)?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let local = listener.local_addr()?;
         let forward = tokio::spawn(client.clone().forward(node.addr(), "t3".into(), listener));
@@ -2101,7 +2393,7 @@ mod recovery_tests {
             NetOptions::loopback(),
         )
         .await?;
-        guest.remember_peer(&node.addr(), "owner", &["t3".into()])?;
+        guest.remember_peer(&node.addr(), "owner", &["t3".into()], false)?;
         let result = timeout(Duration::from_secs(3), exchange(local)).await;
         forward.abort();
         client.close().await;

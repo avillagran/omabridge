@@ -51,6 +51,10 @@ revoking the peer) stops new pairings immediately. Existing sessions belong to
 T3: list them with `t3 auth session list` and revoke the ones labelled
 `omabridge:<peer>`. Omarchy T3 Code does this on the host on every pass.
 
+A device that never paired with a host can get its T3 through a bridge the host
+consented to, under a different label: see
+[all-hosts invitations](delegated-enrollment.md#all-hosts-invitations).
+
 ## Tests
 
 `cargo test --release --test t3_pair` covers the following over real loopback

@@ -55,6 +55,7 @@ fn manager(root: &Path, name: &str, runner: Arc<FakeRunner>) -> Manager {
         t3_runtime: root.join(format!("{name}-t3/server-runtime.json")),
         publish_wait: Duration::ZERO,
         pair_timeout: Duration::from_secs(20),
+        remote: false,
     }
 }
 

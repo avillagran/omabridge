@@ -140,6 +140,15 @@ Android retains one selected bridge and its existing API. See
 [delegated enrollment](docs/delegated-enrollment.md) for configuration, trust,
 limits and isolated verification. No authority is enabled by default.
 
+## One invitation for all hosts
+
+`omabridge invite --service t3 --all-hosts` lets a phone reach, after one approval
+on the inviting device, every host that allowed this bridge with `omabridge
+bridge-consent --peer <bridge>`. `omabridge catalog-publish --auto` keeps its catalog
+current, leaving out and reporting hosts without a verified HTTPS route. The
+read-only enrollment above is unchanged. See
+[all-hosts invitations](docs/delegated-enrollment.md#all-hosts-invitations).
+
 ## Managing a device from other front ends
 
 T3 Code, the Omarchy Control Panel and bar widgets manage OmaBridge through one command, so validation, confirmation, secrets and the background unit stay in OmaBridge itself:
@@ -241,6 +250,7 @@ See [docs/native-runtime.md](docs/native-runtime.md) for the full flow and for r
 - **Secrets stay out of view.** Invitations, keys and tokens are never printed to logs. Private state is mode 0700/0600.
 - **Relays see only ciphertext.** A relay only forwards encrypted QUIC and is never an enrollment authority. It does see endpoint IDs and IP addresses; use `--relay none` or your own relay to avoid n0's.
 - **A `t3` grant is T3 access.** A device holding it can obtain a one-use native T3 pairing (`t3-pair`) with T3's default scopes. Grant `t3` only to your own devices.
+- **All-hosts invitations are opt-in on both ends.** `invite --all-hosts` gives a device write access to every host that consented, once approved. Each host consents once per bridge with `bridge-consent`; a `t3` grant does not imply it, no managing device can set it or approve such an invitation, and the host checks it on every request. A consented bridge is a trusted broker: it can see the one-use pairings it passes on. Withdrawing consent stops new credentials and removes the host from the catalog; sessions already issued (30 days, labelled `omabridge-delegated:<bridge>:<client>`) stay until revoked in T3.
 - **No port attestation.** A published loopback port is trusted by address; OmaBridge does not verify which process owns it. Do not publish an untrusted local service under a well-known name such as `t3`.
 
 ## What does not work yet

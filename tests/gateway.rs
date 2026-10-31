@@ -173,6 +173,7 @@ async fn a_gateway_reaches_only_its_target_under_its_name() -> anyhow::Result<()
             t3_runtime: dir.path().join("runtime.json"),
             publish_wait: Duration::ZERO,
             pair_timeout: Duration::from_secs(2),
+            remote: false,
         };
         let other = gateway::Gateway {
             host: "other.vpn.test".into(),

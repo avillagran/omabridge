@@ -8,7 +8,9 @@ bridge; an installed binary must support `delegated-enrollment-v1`.
 
 The owner must consent on each issuing host. An existing `t3` service grant,
 management rights, a matching descriptor UUID or desktop discovery alone does
-not authorize delegation. The selected desktop is trusted to assert the
+not authorize delegation. This consent is the JSON policy below and covers the
+read-only path only. The write-capable all-hosts path has its own per-bridge bit,
+which never widens this one: see [All-hosts invitations](#all-hosts-invitations). The selected desktop is trusted to assert the
 allowlisted downstream endpoint identity, and sees the freshly issued bearer.
 This is a trusted broker, not end-to-end proof of possession by Android.
 
@@ -95,7 +97,110 @@ cross-host immediate-revocation promise in this change. Reconfigure trust using
 atomic files; as with normal grant checks, a revoke-and-regrant entirely between
 checks is not a historical revocation event log.
 
+## All-hosts invitations
+
+One invitation can opt in to every consenting host, with T3's default scopes
+(write access, including `orchestration:operate`) and no per-host QR. It is a
+separate path: `Enroll`, `DelegatedEnroll` and `redeem` stay bounded read-only.
+
+**Host consent.** On each host, once per bridge:
+
+```sh
+omabridge bridge-consent --peer <bridge>             # allow
+omabridge bridge-consent --peer <bridge> --withdraw
+```
+
+or the local manage action `{"action":"bridge-consent-set","peer":"<id>","allowed":true,"confirmed":true}`.
+It means "allow this bridge to invite devices with full access". It needs a `t3`
+grant, but a `t3` grant never implies it. Losing `t3` clears it and a new grant
+does not bring it back. Hosts without it are left out. No managing device can set
+it (the action is not in `REMOTE_ACTIONS`), and `Hello` only tells the bridge what
+the host reported: the host checks its own bit on every request.
+
+**Invitation.** `omabridge invite --service t3 --all-hosts`, or `"allHosts":true`
+on the `invite` action. The choice stays on the inviting device, in its `Invite`,
+never in the wire `Invitation`, whose unknown fields older devices refuse. Pending
+requests show `allHosts` so the approval screen can say what is being given. Only
+the owner at this device approves one: remote `approve` answers
+`omabridge_remote_forbidden`. A later approval replaces the flag, as it does the
+services.
+
+**Requests.** Both are refused with `Denied` and hold no credential in errors.
+
+| Who | Request | Checked |
+| --- | --- | --- |
+| phone → bridge | `{"op":"t3_host_pair","environment_id":"<uuid>"}` | phone's `all_hosts` flag, `t3` grant, environment in its catalog |
+| bridge → host | `{"op":"t3_delegated_pair","environment_id":"<uuid>","client_id":"<phone id>"}` | bridge's consent bit, `t3` grant, environment is this host's |
+
+Both answer `{"result":"t3_host_pairing","pairing":{"environmentId","credential","label"}}`.
+Each side checks again after its I/O, so withdrawal during issuance keeps the
+pairing from leaving, and allows four at once and sixteen a minute per
+authenticated peer. A first enrollment of more than sixteen hosts completes on the
+following refreshes. The pairing is T3's own one-use two-minute credential; the
+phone exchanges it at the host's HTTPS route (`redeem_pairing`), so the bridge
+never holds a session. The bridge does see the pairing in transit, and could
+redeem it first: as with the read-only path it is a trusted broker, which is what
+the host consented to.
+
+The bridge's own T3 goes through the same request, as an ordinary peer pairing
+labelled `omabridge:<phone>`: the phone is a real peer there.
+
+**Label and revocation.** Hosts label these pairings, and the sessions they become,
+`omabridge-delegated:<bridge>:<client>`. T3 gives the session the grant's label
+whatever the client presents. The prefix deliberately does not start with
+`omabridge:`: Omarchy T3 Code revokes every `omabridge:<id>` session whose id is
+not a current `t3` peer, and the phone is not a peer of the host, so a plain label
+would be revoked within minutes. In turn, **that matcher does not revoke these
+sessions**. Omarchy T3 Code must learn to revoke, on the host, each session
+labelled `omabridge-delegated:<bridge>:*` whose `bridge` no longer has `t3` and
+`bridgeConsent` (from `manage` `read`). Until it does, withdrawing consent stops
+new credentials and removes the host from the catalog, but sessions already
+issued live on for up to 30 days unless revoked with `t3 auth session revoke`. The
+phone stops using a withdrawn row, but that is the phone's own courtesy.
+
+**Routes.** A host tells only consented bridges its own public T3 routes
+(`host_routes` in `Hello`, kept as `Peer.remote_routes`). They must be HTTPS on a
+public name with no path; anything else rejects the announcement. A route is a
+hint: nothing is published before its descriptor answers over HTTPS.
+
+**Publishing.** `omabridge catalog-publish --auto [--once] [--interval N]` needs no
+policy or desktop view, and replaces the policy mode on that device. Hosts are the
+peers with `t3` that reported consent, plus this device; each UUID comes from the
+host's descriptor; clients are the `all_hosts` peers holding `t3`. It writes the
+environment → issuer table `all-hosts-issuers.json` and prints a report, one line
+per pass:
+
+```json
+{"catalogChanged":true,"published":[{"host":"<id>","environmentId":"<uuid>"}],
+ "retained":[],"skipped":[{"host":"<id>","reason":"no_route"}],"clientsLeftOut":[]}
+```
+
+`skipped` reasons: `no_route`, `descriptor_mismatch` (a malformed identity, or
+routes of one host disagreeing), `descriptor_unavailable`, `environment_conflict`
+(two hosts naming one UUID; neither is believed), `route_not_portable`, `limit`.
+Unlike policy mode, a mismatch skips that host instead of aborting. A failed probe
+of a host already published is an outage, not a withdrawal: it stays, under
+`retained`.
+
+**Phone.** The JNI op `{"op":"hostPair","handle":H,"environmentId":"<uuid>"}` asks,
+redeems and returns `{accessToken, environmentId, expiresAt, renewAfter, scope,
+status:"native_authorized", baseUrl, provenance}`. `pair` also returns `allHosts`.
+`projection` adds to its plan:
+
+- `hostEnroll`: new environments of an all-hosts bridge. Use `hostPair`, not `enroll`.
+- `renew`: native rows within seven days of ending, or already ended. Use `hostPair`
+  again: T3 sessions last 30 days and do not extend, so a renewal is a new session.
+
+Rows must pass their local `status`. A row with `native_authorized` or
+`native_expired`, with `authorizationExpiresAt`, is exempt from the five-minute
+rule: projection never turns it `discovered` or `expired`, never lists it in
+`enroll` (a read-only token would overwrite the write token) and stops it only on
+withdrawal (`revoked`) or when its session has ended (`native_expired`).
+
 ## Verification
+
+`cargo test --locked --test all_hosts` runs the all-hosts path over three real
+QUIC endpoints, with fixture T3 CLIs and descriptors.
 
 `cargo test --locked --test delegated_enrollment` exercises two distinct real
 QUIC endpoints with an isolated fake T3 CLI/descriptor: original downstream

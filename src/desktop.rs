@@ -138,7 +138,7 @@ impl Desktop {
         client.close().await;
         let (status, services) = match result? {
             PairDecision::Pending => (PairStatus::Pending, Vec::new()),
-            PairDecision::Approved { services } => (PairStatus::Approved, services),
+            PairDecision::Approved { services, .. } => (PairStatus::Approved, services),
         };
         let invite_removed = status == PairStatus::Approved
             && discard_when_approved

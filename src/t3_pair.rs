@@ -11,7 +11,17 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 /// Label prefix of the pairings and the sessions they become on the issuing host.
 pub const LABEL_PREFIX: &str = "omabridge:";
+/// Label of a pairing a host issues through a bridge for a device it never paired
+/// with: `omabridge-delegated:<bridge>:<client>`. It must not start with
+/// `LABEL_PREFIX`: revocation there keeps only sessions of a current peer, and a
+/// client of a bridge is not one. The host revokes these when `bridge` loses
+/// its consent or `t3` grant.
+pub const DELEGATED_LABEL_PREFIX: &str = "omabridge-delegated:";
 const TTL: &str = "2m";
+
+pub fn delegated_label(bridge: &str, client: &str) -> String {
+    format!("{DELEGATED_LABEL_PREFIX}{bridge}:{client}")
+}
 
 /// The T3 Code whose pairings this device issues.
 #[derive(Clone, Debug, PartialEq)]
@@ -42,7 +52,9 @@ impl T3Pairing {
             "invalid T3 pairing"
         );
         ensure!(
-            self.label.starts_with(LABEL_PREFIX) && self.label.len() <= 128,
+            (self.label.starts_with(LABEL_PREFIX)
+                || self.label.starts_with(DELEGATED_LABEL_PREFIX))
+                && self.label.len() <= 256,
             "invalid T3 pairing"
         );
         Ok(())
@@ -99,10 +111,27 @@ impl T3Issuer {
     /// Issues a one-use pairing for `peer`, after the T3 behind `target` (the
     /// published `t3` service) named this issuer's environment.
     pub async fn issue(&self, target: SocketAddr, peer: &str) -> Result<T3Pairing> {
-        ensure!(
-            peer.len() == 64 && peer.bytes().all(|b| b.is_ascii_hexdigit()),
-            "invalid peer"
-        );
+        ensure!(valid_peer(peer), "invalid peer");
+        self.issue_labelled(target, format!("{LABEL_PREFIX}{peer}"))
+            .await
+    }
+
+    /// As `issue`, for `client` of the bridge `bridge`, when this host's T3 is
+    /// `environment`.
+    pub async fn issue_delegated(
+        &self,
+        target: SocketAddr,
+        bridge: &str,
+        client: &str,
+        environment: &str,
+    ) -> Result<T3Pairing> {
+        ensure!(valid_peer(bridge) && valid_peer(client), "invalid peer");
+        ensure!(self.environment()? == environment, "not this environment");
+        self.issue_labelled(target, delegated_label(bridge, client))
+            .await
+    }
+
+    async fn issue_labelled(&self, target: SocketAddr, label: String) -> Result<T3Pairing> {
         ensure!(target.ip().is_loopback(), "T3 must be on loopback");
         let environment = self.environment()?;
         let url = format!("http://{target}/");
@@ -112,7 +141,6 @@ impl T3Issuer {
         })
         .await?
         .map_err(anyhow::Error::msg)?;
-        let label = format!("{LABEL_PREFIX}{peer}");
         let output = tokio::time::timeout(
             Duration::from_secs(20),
             tokio::process::Command::new(&self.cli)
@@ -176,6 +204,47 @@ fn stale_desktop_launcher(path: &std::path::Path) -> bool {
     text.lines()
         .find_map(|line| line.trim().strip_prefix("app='")?.strip_suffix('\''))
         .is_some_and(|app| !is_executable(std::path::Path::new(app)))
+}
+
+fn valid_peer(peer: &str) -> bool {
+    peer.len() == 64 && peer.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Bounds pairing through a bridge like `CompositeAuthority`: four at once and
+/// sixteen a minute per authenticated peer. Callers authorize before asking, so
+/// strangers allocate nothing. Busy requests fail without waiting.
+pub(crate) struct PairLimiter {
+    concurrent: std::sync::Arc<tokio::sync::Semaphore>,
+    attempts: std::sync::Mutex<std::collections::BTreeMap<String, (std::time::Instant, u32)>>,
+}
+
+impl PairLimiter {
+    pub(crate) fn new() -> Self {
+        Self {
+            concurrent: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            attempts: Default::default(),
+        }
+    }
+
+    pub(crate) fn admit(&self, peer: &str) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        const WINDOW: Duration = Duration::from_secs(60);
+        {
+            let mut attempts = self
+                .attempts
+                .lock()
+                .map_err(|_| anyhow::anyhow!("pairing unavailable"))?;
+            attempts.retain(|_, (started, _)| started.elapsed() < WINDOW);
+            let entry = attempts
+                .entry(peer.to_owned())
+                .or_insert((std::time::Instant::now(), 0));
+            ensure!(entry.1 < 16, "pairing rate exceeded");
+            entry.1 += 1;
+        }
+        self.concurrent
+            .clone()
+            .try_acquire_owned()
+            .context("pairing busy")
+    }
 }
 
 fn is_executable(path: &std::path::Path) -> bool {

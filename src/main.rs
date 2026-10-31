@@ -44,10 +44,14 @@ enum Command {
     Init,
     /// Poll a local sanitized desktop view and publish verified client catalogs.
     CatalogPublish {
-        #[arg(long)]
-        desktop_client: PathBuf,
-        #[arg(long)]
-        policy: PathBuf,
+        #[arg(long, required_unless_present = "auto", requires = "policy")]
+        desktop_client: Option<PathBuf>,
+        #[arg(long, required_unless_present = "auto", requires = "desktop_client")]
+        policy: Option<PathBuf>,
+        /// Needs no desktop view or policy: publish every host that consented to
+        /// this bridge, and this device, to every device approved for all hosts.
+        #[arg(long, conflicts_with_all = ["desktop_client", "policy"])]
+        auto: bool,
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
         interval: u64,
         #[arg(long)]
@@ -106,6 +110,10 @@ enum Command {
         /// Print an invitation URI as a terminal QR. Treat the QR as secret.
         #[arg(long)]
         qr: bool,
+        /// Approving also gives every host that consented to this bridge, with
+        /// T3's default scopes (write access). Needs `--service t3`.
+        #[arg(long)]
+        all_hosts: bool,
     },
     Pair {
         #[arg(long)]
@@ -153,6 +161,15 @@ enum Command {
         peer: String,
         #[arg(long)]
         service: String,
+    },
+    /// Allow a paired bridge to invite devices with full access to this device's
+    /// T3, or withdraw that with `--withdraw`. Only this device can change it.
+    BridgeConsent {
+        /// Endpoint ID or the device's name, when no other paired device has it.
+        #[arg(long)]
+        peer: String,
+        #[arg(long)]
+        withdraw: bool,
     },
     /// Ask a paired device that shares `t3` for a one-use T3 pairing and print it
     /// as JSON (`environmentId`, `credential`, `label`). Treat the output as secret.
@@ -664,17 +681,30 @@ async fn run(args: Args) -> Result<()> {
         Command::CatalogPublish {
             desktop_client,
             policy,
+            auto,
             interval,
             once,
         } => {
             ensure!(
-                desktop_client.is_absolute(),
+                desktop_client
+                    .as_ref()
+                    .is_none_or(|path| path.is_absolute()),
                 "desktop client must be an absolute local path"
             );
             let publisher = omabridge::catalog_publisher::Publisher::new()?;
             loop {
-                match publisher.poll_once(&store, &desktop_client, &policy).await {
-                    Ok(changed) => println!("{}", json!({"catalogChanged":changed})),
+                let pass = match (&desktop_client, &policy) {
+                    (Some(desktop), Some(policy)) if !auto => publisher
+                        .poll_once(&store, desktop, policy)
+                        .await
+                        .map(|changed| json!({"catalogChanged":changed})),
+                    _ => publisher
+                        .publish_auto(&store)
+                        .await
+                        .and_then(|report| Ok(serde_json::to_value(report)?)),
+                };
+                match pass {
+                    Ok(report) => println!("{report}"),
                     Err(_) if !once => eprintln!("catalog_publish_unavailable"),
                     Err(_) => anyhow::bail!("catalog_publish_unavailable"),
                 }
@@ -847,6 +877,7 @@ async fn run(args: Args) -> Result<()> {
             ttl,
             output,
             qr,
+            all_hosts,
         } => {
             let (address, published) = store.active_endpoint()?;
             ensure!(
@@ -854,7 +885,12 @@ async fn run(args: Args) -> Result<()> {
                 "grant only currently published services"
             );
             let now = unix_time()?;
-            let token = store.create_invite(&services, Duration::from_secs(ttl), now)?;
+            let lifetime = Duration::from_secs(ttl);
+            let token = if all_hosts {
+                store.create_all_hosts_invite(&services, lifetime, now)?
+            } else {
+                store.create_invite(&services, lifetime, now)?
+            };
             let invite = Invitation {
                 version: 1,
                 address,
@@ -866,7 +902,7 @@ async fn run(args: Args) -> Result<()> {
             write_document(&output, &invite, false)?;
             println!(
                 "{}",
-                json!({"invite_file":output,"expires":invite.expires,"services":services})
+                json!({"invite_file":output,"expires":invite.expires,"services":services,"all_hosts":all_hosts})
             );
             if qr {
                 let uri = format!(
@@ -990,6 +1026,12 @@ async fn run(args: Args) -> Result<()> {
             }
             // Tokio's stdin thread may still wait on a read nobody needs.
             std::process::exit(0);
+        }
+        Command::BridgeConsent { peer, withdraw } => {
+            let peer = find_peer(&store, &peer).map_err(anyhow::Error::msg)?;
+            store.set_bridge_consent(&peer.id, !withdraw)?;
+            // The running server announces the change within seconds.
+            println!("{}", json!({"peer":peer.id,"bridgeConsent":!withdraw}));
         }
         Command::T3Pair { peer } => {
             let peer = find_peer(&store, &peer).map_err(anyhow::Error::msg)?.id;
