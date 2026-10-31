@@ -12,8 +12,15 @@ categories = ["network-programming", "command-line-utilities"]
 description = "Private device pairing and encrypted service bridges, starting with T3 Code"
 
 [features]
-default = []
+default = ["cli"]
+cli = ["dep:clap"]
+embed = []
 gui = ["dep:eframe"]
+
+[[bin]]
+name = "omabridge"
+path = "src/main.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "omabridge-gui"
@@ -29,7 +36,7 @@ required-features = ["gui"]
 t3-protocol = { git = "https://github.com/avillagran/lib-t3-rust", rev = "8c80c4dc62414c454eaefb4706d973adf8d8ee74" }
 anyhow = "1"
 base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 eframe = { version = "=0.32.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"], optional = true }
 fs2 = "0.4"
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }

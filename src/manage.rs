@@ -29,6 +29,7 @@ pub const SERVE_UNIT: &str = "omabridge-serve.service";
 /// Largest accepted request on stdin.
 pub const REQUEST_LIMIT: usize = 64 * 1024;
 /// What this build supports, for front ends that must work with older ones.
+#[cfg(feature = "cli")]
 pub const FEATURES: &[&str] = &[
     "control-socket",
     "forward-through-server",
@@ -45,6 +46,19 @@ pub const FEATURES: &[&str] = &[
     "mobile-admin-v1",
     "shared-drafts-v1",
 ];
+
+pub const EMBEDDED_FEATURES: &[&str] = &[
+    "control-socket",
+    "forward-through-server",
+    "connect-stdio",
+    "remote-manage",
+    "t3-pair-v1",
+    "service-routes",
+    "mobile-admin-v1",
+    "shared-drafts-v1",
+];
+#[cfg(not(feature = "cli"))]
+pub const FEATURES: &[&str] = EMBEDDED_FEATURES;
 
 const ACTIONS: [&str; 19] = [
     "identity-create",
@@ -123,7 +137,132 @@ const REMOTE_CODES: &[&str] = &[
 pub type Code = &'static str;
 type Outcome<T> = std::result::Result<T, Code>;
 
+/// Publication policy, independent of systemd. Implementations must persist atomically.
+pub trait ServeBackend: Send + Sync + 'static {
+    fn published(&self) -> Value;
+    fn publish(&self, request: &Value) -> Result<(), Code>;
+    fn unpublish(&self) -> Result<(), Code>;
+    fn restart(&self) -> Result<(), Code>;
+    fn allows(&self, service: &str) -> bool;
+    fn restart_events(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
+}
+/// In-process publication. Only services supplied by the host may be enabled.
+pub struct EmbeddedBackend {
+    store: Store,
+    available: Vec<String>,
+    restart: tokio::sync::watch::Sender<u64>,
+}
+impl EmbeddedBackend {
+    pub fn new(store: Store, available: Vec<String>) -> Result<Self, Code> {
+        let backend = Self {
+            store,
+            available,
+            restart: tokio::sync::watch::channel(0).0,
+        };
+        if !backend.store.root().join("services.json").exists() {
+            write_document(&backend.store.root().join("services.json"), &json!({"backend": "embedded", "services": backend.available, "available": backend.available}), true).map_err(|_| "local_error")?;
+        }
+        Ok(backend)
+    }
+    fn services(&self) -> Vec<String> {
+        crate::read_document::<Value>(&self.store.root().join("services.json"))
+            .ok()
+            .and_then(|v| serde_json::from_value(v["services"].clone()).ok())
+            .unwrap_or_default()
+    }
+}
+impl ServeBackend for EmbeddedBackend {
+    fn published(&self) -> Value {
+        json!({"enabled": !self.services().is_empty(), "active": self.store.active_endpoint().is_ok(), "external": false, "services": self.services(), "backend": "embedded"})
+    }
+    fn publish(&self, request: &Value) -> Result<(), Code> {
+        for name in ["t3", "ssh", "mcp"] {
+            if request[name] == true && !self.available.iter().any(|a| a == name) {
+                return Err("omabridge_service_unavailable");
+            }
+        }
+        let services: Vec<_> = self
+            .available
+            .iter()
+            .filter(|name| request[name.as_str()] != false)
+            .cloned()
+            .collect();
+        if services.is_empty() {
+            return Err("omabridge_nothing_to_publish");
+        }
+        write_document(
+            &self.store.root().join("services.json"),
+            &json!({"backend": "embedded", "services": services, "available": self.available}),
+            true,
+        )
+        .map_err(|_| "local_error")
+    }
+    fn unpublish(&self) -> Result<(), Code> {
+        write_document(
+            &self.store.root().join("services.json"),
+            &json!({"backend": "embedded", "services": [], "available": self.available}),
+            true,
+        )
+        .map_err(|_| "local_error")
+    }
+    fn restart(&self) -> Result<(), Code> {
+        self.restart.send_modify(|n| *n = n.wrapping_add(1));
+        Ok(())
+    }
+    fn restart_events(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.restart.subscribe())
+    }
+    fn allows(&self, service: &str) -> bool {
+        self.services().iter().any(|s| s == service)
+    }
+}
+
+/// Existing systemd publication for standalone hosts.
+pub struct UnitsBackend {
+    pub units: Units,
+    pub context: UnitContext,
+    pub services: Vec<(String, SocketAddr)>,
+}
+impl ServeBackend for UnitsBackend {
+    fn published(&self) -> Value {
+        let services = unit_services(&self.units.dir().join(SERVE_UNIT));
+        json!({"enabled": services.is_some(), "active": self.units.status(SERVE_UNIT).is_ok_and(|s| s.active == "active"), "services": services.unwrap_or_default().into_iter().map(|(n,_)|n).collect::<Vec<_>>()})
+    }
+    fn publish(&self, request: &Value) -> Result<(), Code> {
+        let services: Vec<_> = self
+            .services
+            .iter()
+            .filter(|(n, _)| request[n.as_str()] != false)
+            .cloned()
+            .collect();
+        if services.is_empty() {
+            return Err("omabridge_nothing_to_publish");
+        }
+        self.units
+            .install(&self.context, &UnitSpec::Serve { services })
+            .map_err(|_| "omabridge_publish_failed")?;
+        self.restart()
+    }
+    fn unpublish(&self) -> Result<(), Code> {
+        self.units
+            .remove(SERVE_UNIT)
+            .map_err(|_| "omabridge_publish_failed")
+    }
+    fn restart(&self) -> Result<(), Code> {
+        self.units
+            .restart(SERVE_UNIT)
+            .map_err(|_| "omabridge_publish_failed")
+    }
+    fn allows(&self, service: &str) -> bool {
+        unit_services(&self.units.dir().join(SERVE_UNIT))
+            .is_some_and(|s| s.iter().any(|(n, _)| n == service))
+    }
+}
+
 pub struct Manager {
+    pub backend: Option<std::sync::Arc<dyn ServeBackend>>,
     pub state_dir: PathBuf,
     pub options: NetOptions,
     pub units: Units,
@@ -311,6 +450,26 @@ fn unit_services(path: &Path) -> Option<Vec<(String, SocketAddr)>> {
 }
 
 impl Manager {
+    pub fn embedded(store: &Store, backend: std::sync::Arc<dyn ServeBackend>) -> Self {
+        Self {
+            backend: Some(backend),
+            state_dir: store.root().into(),
+            options: NetOptions::loopback(),
+            units: Units::new(
+                store.root().join("unused-units"),
+                std::sync::Arc::new(Deferred::default()),
+            ),
+            binary: PathBuf::new(),
+            awaiting_dir: store.root().join("awaiting"),
+            invite_dir: store.root().join("invites"),
+            ssh_target: "127.0.0.1:22".parse().unwrap(),
+            mcp_target: "127.0.0.1:8787".parse().unwrap(),
+            t3_runtime: store.root().join("unused-runtime"),
+            publish_wait: Duration::ZERO,
+            pair_timeout: Duration::from_secs(30),
+            remote: false,
+        }
+    }
     /// The real user environment: systemd `--user`, XDG directories and this executable.
     /// `relay` overrides the device's saved relay for this request (`--relay`).
     pub fn from_env(state_dir: PathBuf, bind: SocketAddr, relay: Option<Relay>) -> Outcome<Self> {
@@ -329,6 +488,16 @@ impl Manager {
             .filter(|path| path.is_absolute())
             .unwrap_or_else(|| home.join(".t3"));
         Ok(Self {
+            backend: crate::read_document::<Value>(&state_dir.join("services.json"))
+                .ok()
+                .filter(|v| v["backend"] == "embedded")
+                .and_then(|v| serde_json::from_value::<Vec<String>>(v["available"].clone()).ok())
+                .and_then(|available| {
+                    Store::open(&state_dir, "o3-server")
+                        .ok()
+                        .and_then(|store| EmbeddedBackend::new(store, available).ok())
+                })
+                .map(|backend| std::sync::Arc::new(backend) as std::sync::Arc<dyn ServeBackend>),
             state_dir,
             options,
             units: Units::user().map_err(|_| "local_error")?,
@@ -353,6 +522,14 @@ impl Manager {
             return Err("invalid_command");
         }
         let action = text(request, "action");
+        if self.backend.is_some()
+            && matches!(
+                action,
+                "relay-set" | "relay-host" | "gateway-set" | "gateway-domain-set"
+            )
+        {
+            return Err("omabridge_embedded_unsupported");
+        }
         if action == "read" {
             let mut snapshot = self.snapshot();
             snapshot["relayHost"]["suggested"] = self.relay_suggestion().await;
@@ -581,7 +758,7 @@ impl Manager {
         json!({
             "available": true,
             "version": env!("CARGO_PKG_VERSION"),
-            "features": FEATURES,
+            "features": if self.backend.is_some() { EMBEDDED_FEATURES } else { FEATURES },
             "identity": store.is_some(),
             "draftStore": device.as_ref().map(|d| json!({"owner":d["id"],"service":crate::drafts::SERVICE,"protocol":1})),
             "device": device,
@@ -626,6 +803,9 @@ impl Manager {
     /// unit or, when `external`, by another program (an older front end's unit or
     /// a manual `serve`). `services` are what is served now, else what the unit names.
     fn published(&self, store: Option<&Store>) -> Value {
+        if let Some(b) = &self.backend {
+            return b.published();
+        }
         let unit = unit_services(&self.units.dir().join(SERVE_UNIT));
         let unit_active = unit.is_some()
             && self
@@ -996,6 +1176,9 @@ impl Manager {
     }
 
     async fn publish(&self, request: &Value) -> Outcome<()> {
+        if let Some(b) = &self.backend {
+            return b.publish(request);
+        }
         let mut services = Vec::new();
         let t3 = self.t3_port();
         match (request["t3"].as_bool(), t3) {
@@ -1116,6 +1299,9 @@ impl Manager {
 
     /// This device is served by its own active publishing unit.
     fn serves_itself(&self) -> bool {
+        if self.backend.is_some() {
+            return true;
+        }
         unit_services(&self.units.dir().join(SERVE_UNIT)).is_some()
             && self
                 .units
@@ -1683,6 +1869,9 @@ impl Manager {
     }
 
     fn unpublish(&self) -> Outcome<()> {
+        if let Some(b) = &self.backend {
+            return b.unpublish();
+        }
         let path = self.units.dir().join(SERVE_UNIT);
         if fs::symlink_metadata(&path).is_err() {
             return Ok(());
@@ -1757,6 +1946,14 @@ pub async fn serve_remote(
     peer: &str,
     command: &Value,
 ) -> (Value, std::sync::Arc<Deferred>) {
+    serve_remote_with_backend(store, peer, command, None).await
+}
+pub async fn serve_remote_with_backend(
+    store: &Store,
+    peer: &str,
+    command: &Value,
+    backend: Option<std::sync::Arc<dyn ServeBackend>>,
+) -> (Value, std::sync::Arc<Deferred>) {
     let deferred = std::sync::Arc::new(Deferred::default());
     let action = text(command, "action");
     // Only listed action names reach the audit, never caller-chosen text.
@@ -1765,7 +1962,7 @@ pub async fn serve_remote(
         .find(|known| **known == action)
         .copied()
         .unwrap_or("other");
-    let result = run_remote(store, peer, command, deferred.clone()).await;
+    let result = run_remote(store, peer, command, deferred.clone(), backend).await;
     if result.is_ok() && action != "relay-set" {
         confirm_relay(store.root());
     }
@@ -1783,6 +1980,7 @@ async fn run_remote(
     peer: &str,
     command: &Value,
     deferred: std::sync::Arc<Deferred>,
+    backend: Option<std::sync::Arc<dyn ServeBackend>>,
 ) -> Outcome<Value> {
     let peers = store.peers().map_err(|_| "omabridge_command_failed")?;
     if !peers.iter().any(|item| item.id == peer && item.admin) {
@@ -1848,12 +2046,27 @@ async fn run_remote(
     if action == "relay-host" && !text(command, "url").is_empty() {
         remote_relay_allowed(text(command, "url"))?;
     }
-    let mut manager = Manager::from_env(
-        store.root().to_path_buf(),
-        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-        None,
-    )?;
-    manager.units = Units::new(units::user_unit_dir().map_err(|_| "local_error")?, deferred);
+    let embedded = backend.is_some();
+    if embedded
+        && matches!(
+            action,
+            "relay-set" | "relay-host" | "gateway-set" | "gateway-domain-set"
+        )
+    {
+        return Err("omabridge_embedded_unsupported");
+    }
+    let mut manager = if let Some(backend) = backend {
+        Manager::embedded(store, backend)
+    } else {
+        Manager::from_env(
+            store.root().to_path_buf(),
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            None,
+        )?
+    };
+    if !embedded {
+        manager.units = Units::new(units::user_unit_dir().map_err(|_| "local_error")?, deferred);
+    }
     manager.publish_wait = Duration::ZERO;
     manager.remote = true;
     let previous = Relay::load(store.root()).unwrap_or_default();

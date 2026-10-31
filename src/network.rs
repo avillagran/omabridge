@@ -966,7 +966,7 @@ async fn serve_delegated_pair(
         .context("T3 pairing unavailable")?;
     let target = services.resolve("t3").context("T3 unavailable")?;
     let pairing = issuer
-        .issue_delegated(target, peer, client, environment)
+        .issue_delegated(target.tcp(), peer, client, environment)
         .await?;
     // Withdrawing consent while T3 was asked keeps the pairing from leaving.
     ensure!(store.bridge_consented(peer)?, "delegated pairing withdrawn");
@@ -1002,7 +1002,7 @@ async fn serve_host_pair(
             .t3_issuer
             .as_ref()
             .context("T3 pairing unavailable")?
-            .issue(target, peer)
+            .issue(target.tcp(), peer)
             .await?
     } else {
         ensure!(
@@ -1359,6 +1359,7 @@ pub fn unix_time() -> Result<u64> {
 }
 
 async fn endpoint(store: &Store, options: &NetOptions, incoming: bool) -> Result<Endpoint> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(store.secret_key()?)
         .clear_ip_transports()
@@ -1397,7 +1398,74 @@ async fn read_header<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
     serde_json::from_slice(&bytes).context("invalid control header")
 }
 
+/// A raw HTTP/WS stream, dispatched without a loopback socket.
+pub trait LocalService: Send + Sync + 'static {
+    fn serve(
+        self: Arc<Self>,
+        io: tokio::io::DuplexStream,
+        peer: PeerInfo,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+}
+#[derive(Clone, Debug)]
+pub struct PeerInfo {
+    pub remote_id: String,
+    pub service: String,
+    pub public: bool,
+}
+#[derive(Clone)]
+pub enum Target {
+    Tcp(SocketAddr),
+    Local(Arc<dyn LocalService>),
+}
+impl Target {
+    fn tcp(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Tcp(a) => Some(*a),
+            _ => None,
+        }
+    }
+}
+trait ServiceIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ServiceIo for T {}
+/// Legacy constructors retain every existing task. Embedded mode opts in explicitly.
+#[derive(Clone)]
+pub struct NodeConfig {
+    pub backend: Option<Arc<dyn crate::manage::ServeBackend>>,
+    pub control_socket: bool,
+    pub gateways: bool,
+    pub relay_host: bool,
+    pub sync: bool,
+}
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            backend: None,
+            control_socket: true,
+            gateways: true,
+            relay_host: true,
+            sync: true,
+        }
+    }
+}
+impl NodeConfig {
+    pub fn embedded() -> Self {
+        Self {
+            backend: None,
+            control_socket: true,
+            gateways: false,
+            relay_host: false,
+            sync: false,
+        }
+    }
+}
+async fn enabled<F: std::future::Future<Output = ()>>(yes: bool, future: F) {
+    if yes {
+        future.await
+    }
+}
+
 pub struct Node {
+    attached: Vec<JoinHandle<()>>,
     endpoint: Endpoint,
     relay: Option<RelayUrl>,
     task: JoinHandle<()>,
@@ -1496,6 +1564,38 @@ impl Node {
         t3_runtime: Option<PathBuf>,
         t3_issuer: Option<Option<crate::t3_pair::T3Issuer>>,
     ) -> Result<Self> {
+        let issuer = match t3_issuer {
+            Some(i) => i,
+            None if services.contains_key("t3") => crate::t3_pair::T3Issuer::detect(),
+            None => None,
+        }
+        .map(|i| Arc::new(i) as Arc<dyn crate::t3_pair::PairingIssuer>);
+        Self::start_configured(
+            store,
+            services
+                .into_iter()
+                .map(|(n, a)| (n, Target::Tcp(a)))
+                .collect(),
+            options,
+            reservation,
+            authority,
+            t3_runtime,
+            issuer,
+            NodeConfig::default(),
+        )
+        .await
+    }
+    /// No environment discovery, subprocess issuer, or global state path is inferred.
+    pub async fn start_configured(
+        store: Store,
+        services: BTreeMap<String, Target>,
+        options: NetOptions,
+        reservation: RuntimeReservation,
+        authority: Option<Arc<dyn crate::enrollment::EnrollmentAuthority>>,
+        t3_runtime: Option<PathBuf>,
+        t3_issuer: Option<Arc<dyn crate::t3_pair::PairingIssuer>>,
+        config: NodeConfig,
+    ) -> Result<Self> {
         if let Some(runtime) = &t3_runtime {
             ensure!(
                 runtime.is_absolute() && services.contains_key("t3"),
@@ -1512,7 +1612,10 @@ impl Node {
         );
         for (name, target) in &services {
             ensure!(
-                valid_service(name) && target.ip().is_loopback() && target.port() != 0,
+                valid_service(name)
+                    && target
+                        .tcp()
+                        .is_none_or(|a| a.ip().is_loopback() && a.port() != 0),
                 "services require a valid name and explicit loopback TCP target"
             );
         }
@@ -1526,33 +1629,43 @@ impl Node {
             Relay::Custom(url) => Some(url.clone()),
             _ => None,
         };
-        let sync = tokio::spawn(sync_loop(
-            endpoint.clone(),
-            options.clone(),
-            store.clone(),
-            relay.clone(),
+        let control_listener = if config.control_socket {
+            Some(control_socket(&store).context("cannot bind private control socket")?)
+        } else {
+            None
+        };
+        let sync = tokio::spawn(enabled(
+            config.sync,
+            sync_loop(
+                endpoint.clone(),
+                options.clone(),
+                store.clone(),
+                relay.clone(),
+            ),
         ));
-        let control = tokio::spawn(control_loop(
-            control_socket(&store),
-            endpoint.clone(),
-            options.clone(),
-            store.clone(),
-            relay.clone(),
+        let control = tokio::spawn(enabled(
+            config.control_socket,
+            control_loop(
+                control_listener,
+                endpoint.clone(),
+                options.clone(),
+                store.clone(),
+                relay.clone(),
+            ),
         ));
-        let hosting = tokio::spawn(crate::hosting::host_loop(store.clone()));
-        let gateways = tokio::spawn(crate::gateway::gateway_loop(
-            store.clone(),
-            endpoint.clone(),
-            options.clone(),
+        let hosting = tokio::spawn(enabled(
+            config.relay_host,
+            crate::hosting::host_loop(store.clone()),
+        ));
+        let gateways = tokio::spawn(enabled(
+            config.gateways,
+            crate::gateway::gateway_loop(store.clone(), endpoint.clone(), options.clone()),
         ));
         let announce = relay.clone();
         let listener = endpoint.clone();
-        let t3_issuer = match t3_issuer {
-            Some(issuer) => issuer,
-            None if services.contains_key("t3") => crate::t3_pair::T3Issuer::detect(),
-            None => None,
-        };
+        let mut restarts = config.backend.as_ref().and_then(|b| b.restart_events());
         let services = Arc::new(ServiceTargets {
+            backend: config.backend,
             fixed: services,
             t3_runtime,
             t3_issuer,
@@ -1569,6 +1682,10 @@ impl Node {
             let mut workers = JoinSet::new();
             loop {
                 tokio::select! {
+                    _ = async { match &mut restarts { Some(events) => { let _ = events.changed().await; }, None => std::future::pending::<()>().await } } => {
+                        // Restart service sessions while preserving the endpoint identity and control socket.
+                        workers.abort_all();
+                    }
                     incoming = listener.accept() => {
                         let Some(incoming) = incoming else { break };
                         let Ok(permit) = capacity.clone().try_acquire_owned() else { incoming.refuse(); continue };
@@ -1623,6 +1740,7 @@ impl Node {
             }
         });
         Ok(Self {
+            attached: Vec::new(),
             endpoint,
             relay,
             task,
@@ -1633,10 +1751,17 @@ impl Node {
             _runtime_lock: reservation,
         })
     }
+    /// Tasks owned by the host share this node's shutdown lifetime.
+    pub fn attach_task(&mut self, task: JoinHandle<()>) {
+        self.attached.push(task);
+    }
     pub fn addr(&self) -> EndpointAddr {
         advertised(&self.endpoint, self.relay.as_ref())
     }
     pub async fn shutdown(self) {
+        for task in &self.attached {
+            task.abort();
+        }
         self.task.abort();
         self.sync.abort();
         self.control.abort();
@@ -1647,6 +1772,9 @@ impl Node {
 }
 impl Drop for Node {
     fn drop(&mut self) {
+        for task in &self.attached {
+            task.abort();
+        }
         self.task.abort();
         self.sync.abort();
         self.control.abort();
@@ -1656,9 +1784,10 @@ impl Drop for Node {
 }
 
 struct ServiceTargets {
-    fixed: BTreeMap<String, SocketAddr>,
+    backend: Option<Arc<dyn crate::manage::ServeBackend>>,
+    fixed: BTreeMap<String, Target>,
     t3_runtime: Option<PathBuf>,
-    t3_issuer: Option<crate::t3_pair::T3Issuer>,
+    t3_issuer: Option<Arc<dyn crate::t3_pair::PairingIssuer>>,
     /// A bridge reaches hosts with its own identity while it serves.
     endpoint: Endpoint,
     options: NetOptions,
@@ -1666,8 +1795,11 @@ struct ServiceTargets {
 }
 
 impl ServiceTargets {
-    fn resolve(&self, service: &str) -> Option<SocketAddr> {
-        let fixed = *self.fixed.get(service)?;
+    fn resolve(&self, service: &str) -> Option<Target> {
+        if self.backend.as_ref().is_some_and(|b| !b.allows(service)) {
+            return None;
+        }
+        let fixed = self.fixed.get(service)?.clone();
         if service != "t3" {
             return Some(fixed);
         }
@@ -1691,7 +1823,7 @@ impl ServiceTargets {
             return None;
         }
         let runtime: Runtime = serde_json::from_slice(&bytes).ok()?;
-        (runtime.port != 0).then(|| SocketAddr::from(([127, 0, 0, 1], runtime.port)))
+        (runtime.port != 0).then(|| Target::Tcp(SocketAddr::from(([127, 0, 0, 1], runtime.port))))
     }
 }
 
@@ -1870,7 +2002,13 @@ async fn serve_connection(
         }
         Request::Manage { command } => {
             // Authorization, the allowed actions and the audit live in `manage`.
-            let (result, deferred) = crate::manage::serve_remote(&store, &peer, &command).await;
+            let (result, deferred) = crate::manage::serve_remote_with_backend(
+                &store,
+                &peer,
+                &command,
+                services.backend.clone(),
+            )
+            .await;
             write_header(&mut send, &Response::Managed { outcome: result }).await?;
             send.finish()?;
             let _ = timeout(DENIED_LINGER, connection.closed()).await;
@@ -1885,7 +2023,7 @@ async fn serve_connection(
                     .as_ref()
                     .context("T3 pairing unavailable")?;
                 let target = services.resolve("t3").context("T3 unavailable")?;
-                let pairing = issuer.issue(target, &peer).await?;
+                let pairing = issuer.issue(target.tcp(), &peer).await?;
                 // Recheck the grant after an issuance that awaited I/O.
                 ensure!(store.authorized(&peer, "t3")?, "T3 pairing withdrawn");
                 Ok(pairing)
@@ -1930,7 +2068,8 @@ async fn serve_connection(
         } => {
             // A gateway's anonymous client needs this device's consent to public exposure too.
             let allowed = |store: &Store| -> Result<bool> {
-                Ok(store.authorized(&peer, &service)?
+                Ok(services.backend.as_ref().is_none_or(|b| b.allows(&service))
+                    && store.authorized(&peer, &service)?
                     && (!public
                         || (crate::gateway::PUBLIC_SERVICES.contains(&service.as_str())
                             && store.public_allowed(&peer, &service)?)))
@@ -1945,13 +2084,29 @@ async fn serve_connection(
                 let _ = timeout(DENIED_LINGER, connection.closed()).await;
                 return Ok(());
             };
-            let socket = match timeout(SETUP_TIMEOUT, TcpStream::connect(target)).await {
-                Ok(Ok(socket)) => socket,
-                _ => {
-                    write_header(&mut send, &Response::Denied).await?;
-                    send.finish()?;
-                    let _ = timeout(DENIED_LINGER, connection.closed()).await;
-                    return Ok(());
+            let socket: Box<dyn ServiceIo> = match target {
+                Target::Local(handler) => {
+                    let (ours, theirs) = tokio::io::duplex(32 * 1024);
+                    tokio::spawn(handler.serve(
+                        theirs,
+                        PeerInfo {
+                            remote_id: peer.clone(),
+                            service: service.clone(),
+                            public,
+                        },
+                    ));
+                    Box::new(ours)
+                }
+                Target::Tcp(target) => {
+                    match timeout(SETUP_TIMEOUT, TcpStream::connect(target)).await {
+                        Ok(Ok(socket)) => Box::new(socket),
+                        _ => {
+                            write_header(&mut send, &Response::Denied).await?;
+                            send.finish()?;
+                            let _ = timeout(DENIED_LINGER, connection.closed()).await;
+                            return Ok(());
+                        }
+                    }
                 }
             };
             let compressed = compress_t3

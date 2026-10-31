@@ -43,6 +43,7 @@ fn manager(root: &Path, name: &str, runner: Arc<FakeRunner>) -> Manager {
     let invites = root.join(format!("{name}-invites"));
     fs::create_dir_all(&invites).unwrap();
     Manager {
+        backend: None,
         state_dir: root.join(format!("{name}-state")),
         options: NetOptions::loopback(),
         units: Units::new(root.join(format!("{name}-units")), runner),

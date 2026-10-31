@@ -162,6 +162,7 @@ async fn a_gateway_reaches_only_its_target_under_its_name() -> anyhow::Result<()
         }
         host.publish_endpoint(&node_host.addr(), &["ssh".to_owned()])?;
         let manager = omabridge::manage::Manager {
+        backend: None,
             state_dir: host.root().to_path_buf(),
             options: NetOptions { compress_t3: true, ..NetOptions::loopback() },
             units: omabridge::units::Units::new(dir.path().join("units"), Arc::new(NoSystemctl)),

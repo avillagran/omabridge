@@ -527,6 +527,7 @@ fn manager(root: &Path) -> Manager {
     let directory = root.join("units");
     std::fs::create_dir_all(&directory).unwrap();
     Manager {
+        backend: None,
         state_dir: root.join("device"),
         options: NetOptions::loopback(),
         units: Units::new(directory, Arc::new(NoUnits)),

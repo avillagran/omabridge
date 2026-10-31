@@ -323,3 +323,49 @@ mod tests {
         }
     }
 }
+
+/// Explicit pairing authority. Embedded hosts supply their own store-backed issuer.
+/// `target` is absent for a local service; CLI issuers refuse that case.
+pub trait PairingIssuer: Send + Sync + 'static {
+    fn issue<'a>(
+        &'a self,
+        target: Option<SocketAddr>,
+        peer: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T3Pairing>> + Send + 'a>>;
+    fn issue_delegated<'a>(
+        &'a self,
+        target: Option<SocketAddr>,
+        bridge: &'a str,
+        client: &'a str,
+        environment: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T3Pairing>> + Send + 'a>>;
+}
+impl PairingIssuer for T3Issuer {
+    fn issue<'a>(
+        &'a self,
+        target: Option<SocketAddr>,
+        peer: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T3Pairing>> + Send + 'a>> {
+        Box::pin(async move {
+            self.issue(target.context("CLI issuer requires TCP")?, peer)
+                .await
+        })
+    }
+    fn issue_delegated<'a>(
+        &'a self,
+        target: Option<SocketAddr>,
+        bridge: &'a str,
+        client: &'a str,
+        environment: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T3Pairing>> + Send + 'a>> {
+        Box::pin(async move {
+            self.issue_delegated(
+                target.context("CLI issuer requires TCP")?,
+                bridge,
+                client,
+                environment,
+            )
+            .await
+        })
+    }
+}
