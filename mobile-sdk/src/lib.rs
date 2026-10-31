@@ -34,6 +34,9 @@ fn call(v: Value) -> Result<Value> {
         .lock()
         .map_err(|_| anyhow::anyhow!("native_error"))?;
     let op = text(&v, "op")?;
+    if op == "capabilities" {
+        return Ok(json!({"abi":1,"features":["mobile-admin-v1","shared-drafts-v1"]}));
+    }
     if op == "open" {
         let path = std::path::Path::new(text(&v, "stateDir")?);
         anyhow::ensure!(path.is_absolute(), "invalid_state_directory");
@@ -112,6 +115,24 @@ fn call(v: Value) -> Result<Value> {
     }
     let s = sessions.get_mut(&id).context("invalid_handle")?;
     match op {
+        "peers" => Ok(json!({"clientId":s.store.id()?,"peers":s.store.peers()?})),
+        "manage" | "drafts" => {
+            let peer = text(&v, "peer")?;
+            let found = omabridge::find_peer(&s.store, peer).map_err(anyhow::Error::msg)?;
+            let address = found.address.context("peer_address_missing")?;
+            let command = &v["command"];
+            if op == "manage" {
+                anyhow::ensure!(
+                    command["action"] == "read"
+                        || command["action"] == "endpoints"
+                        || v["confirmed"] == true,
+                    "confirmation_required"
+                );
+                s.runtime.block_on(s.client.manage(&address, command))
+            } else {
+                s.runtime.block_on(s.client.drafts(&address, command))
+            }
+        }
         "pair" => {
             let invite: Invitation =
                 serde_json::from_value(v["invitation"].clone()).context("invalid_invitation")?;
@@ -237,6 +258,7 @@ pub unsafe extern "C" fn omabridge_mobile_call(
             Err(error) => {
                 let codes = [
                     "invalid_input",
+                    "confirmation_required",
                     "invalid_invitation",
                     "unsupported or expired invitation",
                     "pairing denied",
@@ -293,5 +315,134 @@ pub unsafe extern "C" fn omabridge_mobile_free(ptr: *mut std::ffi::c_char) {
         for byte in &mut owned {
             unsafe { std::ptr::write_volatile(byte, 0) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omabridge::{NetOptions, Node};
+    use std::{collections::BTreeMap, ffi::CStr, time::Duration};
+
+    fn abi(input: Value) -> Value {
+        let bytes = serde_json::to_vec(&input).unwrap();
+        unsafe {
+            let raw = omabridge_mobile_call(bytes.as_ptr(), bytes.len());
+            let value = serde_json::from_slice(CStr::from_ptr(raw).to_bytes()).unwrap();
+            omabridge_mobile_free(raw);
+            value
+        }
+    }
+    #[test]
+    fn mobile_abi_admin_and_drafts_over_real_peer() -> Result<()> {
+        assert_eq!(abi(json!({"op":"capabilities"}))["ok"]["abi"], 1);
+        let dir = tempfile::tempdir()?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        let owner = Store::open(&dir.path().join("owner"), "owner")?;
+        let node = runtime.block_on(Node::start(
+            owner.clone(),
+            BTreeMap::from([("t3".into(), "127.0.0.1:9".parse()?)]),
+            NetOptions::loopback(),
+        ))?;
+        owner.publish_endpoint(&node.addr(), &["t3".into()])?;
+        let opened =
+            abi(json!({"op":"open","stateDir":dir.path().join("mobile"),"directOnly":true}));
+        let handle = opened["ok"]["handle"].clone();
+        let phone = opened["ok"]["clientId"].as_str().context("open failed")?;
+        let now = omabridge::unix_time()?;
+        let invite = Invitation {
+            version: 1,
+            address: node.addr(),
+            token: owner.create_invite(
+                &["t3".into(), "drafts".into()],
+                Duration::from_secs(300),
+                now,
+            )?,
+            name: "owner".into(),
+            expires: now + 300,
+            manage: false,
+        };
+        let pair = json!({"op":"pair","handle":handle,"invitation":invite});
+        assert_eq!(abi(pair.clone())["ok"]["approved"], false);
+        owner.approve(phone, now)?;
+        assert_eq!(abi(pair)["ok"]["approved"], true);
+        let peer = owner.id()?;
+        let read = json!({"op":"manage","handle":handle,"peer":peer,"command":{"action":"read"}});
+        assert_eq!(abi(read.clone())["ok"]["error"], "omabridge_not_admin");
+        owner.set_admin(phone, true)?;
+        let snapshot = abi(read.clone());
+        assert_eq!(snapshot["ok"]["device"]["id"], peer);
+        assert_eq!(snapshot["ok"]["draftStore"]["owner"], peer);
+        assert!(abi(json!({"op":"peers","handle":handle}))["ok"]["peers"].is_array());
+        let rename = json!({"op":"manage","handle":handle,"peer":peer,"command":{"action":"rename","name":"renamed"}});
+        assert_eq!(abi(rename.clone())["error"], "confirmation_required");
+        let mut confirmed = rename;
+        confirmed["confirmed"] = json!(true);
+        assert_eq!(abi(confirmed)["ok"]["device"]["name"], "renamed");
+        for action in [
+            "bridge-consent-set",
+            "admin-set",
+            "grant-set",
+            "gateway-domain-set",
+            "identity-create",
+            "pair",
+        ] {
+            assert_eq!(
+                abi(
+                    json!({"op":"manage","handle":handle,"peer":peer,"confirmed":true,"command":{"action":action}})
+                )["ok"]["error"],
+                "omabridge_remote_forbidden"
+            );
+        }
+        // Issuance returns a one-time secret inline; a remote path is forbidden.
+        let invitation = abi(
+            json!({"op":"manage","handle":handle,"peer":peer,"confirmed":true,"command":{"action":"invite","services":["t3"],"allHosts":true}}),
+        );
+        let created = &invitation["ok"]["created"];
+        assert_eq!(created["allHosts"], true);
+        assert!(created["invitation"]["token"].is_string());
+        assert!(created.get("path").is_none());
+        assert_eq!(
+            abi(
+                json!({"op":"manage","handle":handle,"peer":peer,"confirmed":true,"command":{"action":"invite","services":["ssh"]}})
+            )["ok"]["error"],
+            "omabridge_service_not_granted"
+        );
+        assert_eq!(
+            abi(
+                json!({"op":"manage","handle":handle,"peer":peer,"confirmed":true,"command":{"action":"invite","services":["t3"],"directory":"/tmp"}})
+            )["ok"]["error"],
+            "omabridge_remote_forbidden"
+        );
+        let other = Store::open(&dir.path().join("other"), "other")?;
+        owner.claim(
+            created["invitation"]["token"].as_str().unwrap(),
+            &other.id()?,
+            "other",
+            now,
+        )?;
+        assert_eq!(
+            abi(
+                json!({"op":"manage","handle":handle,"peer":peer,"confirmed":true,"command":{"action":"approve","peer":other.id()?}})
+            )["ok"]["error"],
+            "omabridge_remote_forbidden"
+        );
+        owner.approve(&other.id()?, now)?; // Only the owner at the device can approve it.
+        let command = json!({"op":"put","scope":{"environment":"env","project":"project","kind":"thread","id":"thread"},"expected":null,"mutationId":"mobile-first","payload":{"schema":1,"text":"private mobile draft","attachments":[]}});
+        let saved = abi(json!({"op":"drafts","handle":handle,"peer":peer,"command":command}));
+        assert_eq!(saved["ok"]["status"], "applied");
+        owner.set_services(phone, &["t3".into()], &[])?;
+        assert_eq!(
+            abi(json!({"op":"drafts","handle":handle,"peer":peer,"command":{"op":"list"}}))["ok"]["error"],
+            "draft_forbidden"
+        );
+        owner.set_admin(phone, false)?;
+        assert_eq!(abi(read)["ok"]["error"], "omabridge_not_admin");
+        let audit = std::fs::read_to_string(owner.root().join("manage-audit.jsonl"))?;
+        assert!(!audit.contains("private mobile draft"));
+        assert!(!audit.contains(created["invitation"]["token"].as_str().unwrap()));
+        assert!(abi(json!({"op":"close","handle":handle}))["ok"].is_object());
+        runtime.block_on(node.shutdown());
+        Ok(())
     }
 }

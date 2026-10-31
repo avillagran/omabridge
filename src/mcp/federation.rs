@@ -28,6 +28,7 @@ impl Router {
         let route = if let Some(binding) = store.remote_catalog_binding()? {
             let _guard = self.catalog.lock().await;
             let device = crate::Store {
+                drafts_clock: None,
                 root: binding.device_state,
             };
             let address = device

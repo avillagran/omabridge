@@ -486,7 +486,7 @@ async fn a_managing_device_runs_only_allowed_commands() -> anyhow::Result<()> {
             .manage(&address, &json!({"action":"relay-host","enabled":true,"url":"https://relay.example.net","cert":"/etc/passwd","key":"/etc/passwd"}))
             .await?;
         assert_eq!(chosen_files["error"], "omabridge_remote_forbidden", "certificates are the managed device's choice");
-        for forbidden in ["invite", "identity-create", "admin-set", "pair", "remote"] {
+        for forbidden in ["bridge-consent-set", "identity-create", "admin-set", "pair", "remote"] {
             let answer = admin_client
                 .manage(&address, &json!({"action":forbidden}))
                 .await?;

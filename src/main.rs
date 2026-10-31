@@ -142,6 +142,11 @@ enum Command {
     /// Run one management request read as JSON on stdin and print the new snapshot.
     /// Shared by every front end (T3 Code, the Omarchy Control Panel, bar widgets).
     Manage,
+    /// Private shared draft JSON on stdin; omit peer to use this device as owner.
+    Drafts {
+        #[arg(long)]
+        peer: Option<String>,
+    },
     Forward {
         #[arg(long)]
         peer: String,
@@ -594,7 +599,11 @@ async fn manage(args: Args) -> Result<()> {
         .read_to_end(&mut raw)
     {
         Ok(size) if size <= limit => match serde_json::from_slice::<serde_json::Value>(&raw) {
-            Ok(request) => {
+            Ok(mut request) => {
+                if let Command::Drafts { peer } = &args.command {
+                    request =
+                        json!({"action":"drafts","confirmed":true,"peer":peer,"command":request});
+                }
                 let relay = args.relay.or(args.relay_url.map(Relay::Custom));
                 match omabridge::manage::Manager::from_env(args.state_dir, args.bind, relay) {
                     Ok(manager) => manager.execute(&request).await,
@@ -658,7 +667,7 @@ async fn run(args: Args) -> Result<()> {
         server.shutdown().await?;
         return result;
     }
-    if let Command::Manage = args.command {
+    if matches!(args.command, Command::Manage | Command::Drafts { .. }) {
         return manage(args).await;
     }
     if let Command::Mcp { command } = args.command {
@@ -675,7 +684,7 @@ async fn run(args: Args) -> Result<()> {
         relay,
     };
     match args.command {
-        Command::Relay { .. } | Command::Mcp { .. } | Command::Manage => {
+        Command::Relay { .. } | Command::Mcp { .. } | Command::Manage | Command::Drafts { .. } => {
             unreachable!("handled before device state initialization")
         }
         Command::CatalogPublish {
@@ -881,7 +890,9 @@ async fn run(args: Args) -> Result<()> {
         } => {
             let (address, published) = store.active_endpoint()?;
             ensure!(
-                services.iter().all(|s| published.contains(s)),
+                services
+                    .iter()
+                    .all(|s| s == omabridge::drafts::SERVICE || published.contains(s)),
                 "grant only currently published services"
             );
             let now = unix_time()?;

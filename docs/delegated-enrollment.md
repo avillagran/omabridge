@@ -227,3 +227,10 @@ T3 subject, withdrawal blocking new issuance while an existing bearer remains
 valid, and natural expiry. It prints only fixed boolean evidence. It does not
 run providers. Android/JNI integration remains a separate required acceptance
 step, as do any consented production configuration and physical-device checks.
+
+## Independent phone administration and shared drafts
+
+[Mobile administration](mobile-administration.md) requires the receiving device's
+explicit manage grant; all-hosts approval and bridge consent remain owner-local.
+[Shared drafts](shared-drafts.md) use a separate `drafts` service grant to one
+explicitly selected bridge authority. Neither API widens catalog/enrollment scopes.
