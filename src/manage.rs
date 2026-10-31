@@ -42,6 +42,8 @@ pub const FEATURES: &[&str] = &[
     "service-routes",
     "gateway-domain",
     "all-hosts-invite-v1",
+    "mobile-admin-v1",
+    "shared-drafts-v1",
 ];
 
 const ACTIONS: [&str; 19] = [
@@ -66,10 +68,12 @@ const ACTIONS: [&str; 19] = [
     "bridge-consent-set",
 ];
 
-/// What a managing device may ask: never identities, invitations, pairing
+/// What a managing device may ask: never identities or pairing
 /// from this device, who else may manage it or which bridge may broker it.
-pub const REMOTE_ACTIONS: [&str; 9] = [
+pub const REMOTE_ACTIONS: [&str; 11] = [
     "read",
+    "invite",
+    "endpoints",
     "rename",
     "relay-set",
     "publish",
@@ -81,8 +85,10 @@ pub const REMOTE_ACTIONS: [&str; 9] = [
 ];
 
 /// Codes a managed device may answer with; anything else is reported generically.
-const REMOTE_CODES: [&str; 29] = [
+const REMOTE_CODES: &[&str] = &[
     "invalid_command",
+    "omabridge_service_not_published",
+    "omabridge_invite_directory",
     "local_error",
     "omabridge_not_admin",
     "omabridge_remote_forbidden",
@@ -352,6 +358,34 @@ impl Manager {
             snapshot["relayHost"]["suggested"] = self.relay_suggestion().await;
             return Ok(snapshot);
         }
+        if action == "drafts" {
+            let command = &request["command"];
+            if !["get", "list", "watch", "receipt"].contains(&text(command, "op"))
+                && request["confirmed"] != true
+            {
+                return Err("confirmation_required");
+            }
+            let store = self.store()?;
+            let peer = text(request, "peer");
+            if peer.is_empty() {
+                return Ok(crate::drafts::execute(&store, None, command));
+            }
+            let target = crate::find_peer(&store, peer)?;
+            let address = target.address.ok_or("omabridge_peer_unreachable")?;
+            if let Some(reply) = self
+                .through_service(&store, json!({"peer":target.id,"drafts":command}))
+                .await
+            {
+                let reply = reply?;
+                return Ok(reply.get("outcome").cloned().unwrap_or(reply));
+            }
+            let client = Client::new(store, self.options.clone())
+                .await
+                .map_err(|_| "local_error")?;
+            let outcome = client.drafts(&address, command).await;
+            client.close().await;
+            return outcome.map_err(|_| "omabridge_peer_unreachable");
+        }
         // Reading an invitation the user chose shows what accepting it means.
         if action == "invite-inspect" {
             let (name, expires, manage, inviter) =
@@ -549,6 +583,7 @@ impl Manager {
             "version": env!("CARGO_PKG_VERSION"),
             "features": FEATURES,
             "identity": store.is_some(),
+            "draftStore": device.as_ref().map(|d| json!({"owner":d["id"],"service":crate::drafts::SERVICE,"protocol":1})),
             "device": device,
             "peers": peers.iter().map(|peer| json!({
                 "id": peer.id, "name": peer.name,
@@ -691,18 +726,27 @@ impl Manager {
         if !(60..=3600).contains(&ttl) {
             return Err("invalid_command");
         }
+        if self.remote && (request.get("directory").is_some() || request["manage"] == true) {
+            return Err("omabridge_remote_forbidden");
+        }
         let directory = match text(request, "directory") {
             "" => self.invite_dir.clone(),
             raw => local_path(raw),
         };
-        if !directory.is_absolute() || !fs::metadata(&directory).is_ok_and(|meta| meta.is_dir()) {
+        if !self.remote
+            && (!directory.is_absolute()
+                || !fs::metadata(&directory).is_ok_and(|meta| meta.is_dir()))
+        {
             return Err("omabridge_invite_directory");
         }
         let store = self.store()?;
         let (address, published) = store
             .active_endpoint()
             .map_err(|_| "omabridge_not_published")?;
-        if services.iter().any(|service| !published.contains(service)) {
+        if services
+            .iter()
+            .any(|service| service != crate::drafts::SERVICE && !published.contains(service))
+        {
             return Err("omabridge_service_not_published");
         }
         let now = unix_time().map_err(|_| "local_error")?;
@@ -725,6 +769,11 @@ impl Manager {
             expires: now + ttl,
             manage: request["manage"] == true,
         };
+        if self.remote {
+            return Ok(
+                json!({"invitation":invite,"expires":invite.expires,"services":services,"allHosts":all_hosts}),
+            );
+        }
         write_document(&path, &invite, false).map_err(|_| "omabridge_invite_directory")?;
         let qr = if request["qr"] == true {
             Some(qr_svg(&invite)?)
@@ -1449,6 +1498,9 @@ impl Manager {
         let services = list("services")?;
         // Services the device may also expose publicly through its gateways.
         let public = list("public")?;
+        if public.iter().any(|s| s == crate::drafts::SERVICE) {
+            return Err("invalid_command");
+        }
         if !valid_peer(peer)
             || services
                 .iter()
@@ -1461,7 +1513,10 @@ impl Manager {
         let (_, published) = store
             .active_endpoint()
             .map_err(|_| "omabridge_not_published")?;
-        if services.iter().any(|service| !published.contains(service)) {
+        if services
+            .iter()
+            .any(|service| service != crate::drafts::SERVICE && !published.contains(service))
+        {
             return Err("omabridge_service_not_published");
         }
         store
@@ -1765,6 +1820,19 @@ async fn run_remote(
             .any(|item| item.id == text(command, "peer") && item.admin)
     {
         return Err("omabridge_peer_is_admin");
+    }
+    if action == "invite" {
+        let actor = peers
+            .iter()
+            .find(|p| p.id == peer)
+            .ok_or("omabridge_not_admin")?;
+        let services = command["services"].as_array().ok_or("invalid_command")?;
+        if services
+            .iter()
+            .any(|s| !s.as_str().is_some_and(|s| actor.services.contains(s)))
+        {
+            return Err("omabridge_service_not_granted");
+        }
     }
     if action == "relay-set" {
         remote_relay_allowed(text(command, "relay"))?;

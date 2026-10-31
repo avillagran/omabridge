@@ -4,6 +4,7 @@ pub mod catalog_publisher;
 mod compression;
 pub mod delegated_enrollment;
 pub mod desktop;
+pub mod drafts;
 pub mod egress;
 pub mod enrollment;
 pub mod gateway;

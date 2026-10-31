@@ -197,7 +197,11 @@ enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         host_routes: Vec<crate::routes::ServiceRoute>,
     },
-    /// One `omabridge manage` command from a device this one lets manage it.
+    /// Private owner-scoped drafts, authorized by a separate service grant.
+    Drafts {
+        command: serde_json::Value,
+    },
+    /// One management command from an explicitly authorized administrator.
     Manage {
         command: serde_json::Value,
     },
@@ -245,6 +249,9 @@ enum Response {
         /// Routes to the sender's own T3, given only with that consent.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         host_routes: Vec<crate::routes::ServiceRoute>,
+    },
+    Drafts {
+        outcome: serde_json::Value,
     },
     Managed {
         outcome: serde_json::Value,
@@ -684,6 +691,12 @@ async fn control_request(
     else {
         return json!({ "error": "omabridge_peer_unreachable" });
     };
+    if let Some(command) = request.get("drafts") {
+        return match request_drafts(endpoint, options, &addr, command).await {
+            Ok(outcome) => json!({"outcome":outcome}),
+            Err(_) => json!({"error":"omabridge_peer_unreachable"}),
+        };
+    }
     match request_manage(endpoint, options, &addr, &request["command"]).await {
         Ok(outcome) => json!({ "outcome": outcome }),
         Err(error) if format!("{error:#}").contains("management refused") => {
@@ -1293,6 +1306,27 @@ async fn pair_with(
     }
 }
 
+async fn request_drafts(
+    endpoint: &Endpoint,
+    options: &NetOptions,
+    addr: &EndpointAddr,
+    command: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let (_pipe, response) = request(
+        endpoint,
+        options,
+        addr,
+        &Request::Drafts {
+            command: command.clone(),
+        },
+    )
+    .await?;
+    match response {
+        Response::Drafts { outcome } => Ok(outcome),
+        _ => bail!("drafts refused"),
+    }
+}
+
 async fn request_manage(
     endpoint: &Endpoint,
     options: &NetOptions,
@@ -1828,6 +1862,12 @@ async fn serve_connection(
             send.finish()?;
             let _ = timeout(DENIED_LINGER, connection.closed()).await;
         }
+        Request::Drafts { command } => {
+            let outcome = crate::drafts::execute(&store, Some(&peer), &command);
+            write_header(&mut send, &Response::Drafts { outcome }).await?;
+            send.finish()?;
+            let _ = timeout(DENIED_LINGER, connection.closed()).await;
+        }
         Request::Manage { command } => {
             // Authorization, the allowed actions and the audit live in `manage`.
             let (result, deferred) = crate::manage::serve_remote(&store, &peer, &command).await;
@@ -2023,6 +2063,14 @@ impl Client {
         command: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         request_manage(&self.endpoint, &self.options, addr, command).await
+    }
+    /// Private owner-scoped drafts; authorization is enforced by the authority.
+    pub async fn drafts(
+        &self,
+        addr: &EndpointAddr,
+        command: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        request_drafts(&self.endpoint, &self.options, addr, command).await
     }
     /// Read only this paired device's explicitly allowed environment catalog.
     /// This does not grant T3 access or return any desktop credentials.

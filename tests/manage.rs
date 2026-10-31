@@ -666,7 +666,7 @@ async fn manage_requires_consent_before_being_managed() -> anyhow::Result<()> {
     );
     assert_eq!(
         guest
-            .execute(&json!({"action":"remote","peer":"ab".repeat(32),"command":{"action":"invite"},"confirmed":true}))
+            .execute(&json!({"action":"remote","peer":"ab".repeat(32),"command":{"action":"bridge-consent-set"},"confirmed":true}))
             .await,
         Err("omabridge_remote_forbidden")
     );

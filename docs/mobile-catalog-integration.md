@@ -108,3 +108,10 @@ subjects, then checks the expected desktop/downstream subject. Ambiguous matches
 are denied; the witness returns only a boolean. Wrong-host tokens
 must fail that witness. Raw client metadata and administrator credentials stay in
 the fresh isolated fixture. This changes test evidence, not production enrollment.
+
+## Additive mobile features
+
+The v1 call/free ABI also supports `capabilities`, `peers`, `manage` and `drafts`.
+See [mobile administration](mobile-administration.md) and [shared drafts](shared-drafts.md)
+for exact grants, security boundaries and client integration. Catalog enrollment
+does not confer either management or draft access.
