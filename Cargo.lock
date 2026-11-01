@@ -3487,6 +3487,10 @@ name = "omabridge-mobile"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "iroh",
  "omabridge",
  "reqwest 0.12.28",

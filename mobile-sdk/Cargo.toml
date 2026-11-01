@@ -9,6 +9,10 @@ crate-type = ["staticlib", "rlib"]
 default = []
 lab-tls = ["dep:reqwest012"]
 [dependencies]
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+base64 = "0.22"
 reqwest012 = { package = "reqwest", version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
 omabridge = { path = ".." }
 anyhow = "1"

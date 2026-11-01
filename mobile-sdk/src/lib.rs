@@ -1,5 +1,6 @@
 //! Synchronous C ABI for Android/JNI. Owns its iroh identity and runtime.
 //! This package depends on OmaBridge -> lib-t3-rust; no reverse dependency.
+mod service_request;
 use anyhow::{Context, Result};
 use omabridge::{Client, Invitation, NetOptions, Store, catalog_client::CatalogManager};
 use serde_json::{Value, json};
@@ -30,12 +31,17 @@ fn unix_millis() -> Result<u64> {
         .try_into()?)
 }
 fn call(v: Value) -> Result<Value> {
+    if v["op"] == "cancelServiceRequest" {
+        return service_request::cancel(&v);
+    }
     let mut sessions = registry()
         .lock()
         .map_err(|_| anyhow::anyhow!("native_error"))?;
     let op = text(&v, "op")?;
     if op == "capabilities" {
-        return Ok(json!({"abi":1,"features":["mobile-admin-v1","shared-drafts-v1"]}));
+        return Ok(
+            json!({"abi":1,"features":["mobile-admin-v1","shared-drafts-v1","service-request-v1"]}),
+        );
     }
     if op == "open" {
         let path = std::path::Path::new(text(&v, "stateDir")?);
@@ -115,6 +121,7 @@ fn call(v: Value) -> Result<Value> {
     }
     let s = sessions.get_mut(&id).context("invalid_handle")?;
     match op {
+        "serviceRequest" => service_request::call(s, &v),
         "peers" => Ok(json!({"clientId":s.store.id()?,"peers":s.store.peers()?})),
         "manage" | "drafts" => {
             let peer = text(&v, "peer")?;
