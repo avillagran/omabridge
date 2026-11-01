@@ -1371,9 +1371,26 @@ async fn endpoint(store: &Store, options: &NetOptions, incoming: bool) -> Result
         .clear_ip_transports()
         .clear_address_lookup()
         .bind_addr(options.bind)?;
+    let dev_relay =
+        matches!(&options.relay, Relay::Custom(url) if url.as_str().starts_with("http://"));
+    if dev_relay {
+        builder = builder.clear_ip_transports();
+    }
     builder = builder.relay_mode(match &options.relay {
         Relay::Custom(url) => {
-            ensure!(url.as_str().starts_with("https://"), "relay must use HTTPS");
+            // Programmatic loopback-only HTTP is reserved for isolated dev relays.
+            // Relay::parse still requires HTTPS for persisted/CLI configuration.
+            let dev = url::Url::parse(url.as_str()).is_ok_and(|u| {
+                u.scheme() == "http"
+                    && u.host_str().is_some_and(|h| {
+                        h.parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback())
+                    })
+            });
+            ensure!(
+                url.as_str().starts_with("https://") || dev,
+                "relay must use HTTPS"
+            );
             RelayMode::Custom(url.clone().into())
         }
         Relay::Public => RelayMode::Default,

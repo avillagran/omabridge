@@ -3479,6 +3479,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "url",
  "x509-parser",
 ]
 

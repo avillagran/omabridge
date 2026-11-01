@@ -33,6 +33,7 @@ path = "tests/gui_cli.rs"
 required-features = ["gui"]
 
 [dependencies]
+url = "2"
 t3-protocol = { git = "https://github.com/avillagran/lib-t3-rust", rev = "8c80c4dc62414c454eaefb4706d973adf8d8ee74" }
 anyhow = "1"
 base64 = "0.22"
