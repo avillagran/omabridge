@@ -331,7 +331,7 @@ mod tests {
     use omabridge::{NetOptions, Node};
     use std::{collections::BTreeMap, ffi::CStr, time::Duration};
 
-    fn abi(input: Value) -> Value {
+    pub(super) fn abi(input: Value) -> Value {
         let bytes = serde_json::to_vec(&input).unwrap();
         unsafe {
             let raw = omabridge_mobile_call(bytes.as_ptr(), bytes.len());
