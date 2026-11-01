@@ -98,6 +98,18 @@ struct Invite {
     all_hosts: bool,
 }
 
+/// What a paired device says about itself in one `Hello`, either way.
+#[derive(Clone, Copy)]
+pub(crate) struct Announcement<'a> {
+    pub name: &'a str,
+    pub address: Option<&'a EndpointAddr>,
+    pub managed: bool,
+    pub grants: Option<(&'a [String], &'a [String])>,
+    pub routes: Option<&'a [routes::ServiceRoute]>,
+    pub bridge_consent: bool,
+    pub host_routes: &'a [routes::ServiceRoute],
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Peer {
     pub id: String,
@@ -265,6 +277,25 @@ pub(crate) fn sanitize_address(address: &EndpointAddr) -> EndpointAddr {
         _ => false,
     });
     clean
+}
+
+/// Addresses are hints, so an announcement must not lose the way back. One with
+/// nothing usable changes nothing. One without a relay, as when the peer's home
+/// relay was down for a moment, keeps the known relay: from outside the LAN it can
+/// be the only route, and a dead hint costs one failed path.
+fn merged_address(
+    known: Option<&EndpointAddr>,
+    mut announced: EndpointAddr,
+) -> Option<EndpointAddr> {
+    let relay = |addr: &&iroh::TransportAddr| matches!(addr, iroh::TransportAddr::Relay(_));
+    if announced.addrs.is_empty() {
+        return None;
+    }
+    if !announced.addrs.iter().any(|addr| relay(&addr)) {
+        let kept = known.into_iter().flat_map(|known| known.addrs.iter());
+        announced.addrs.extend(kept.filter(relay).cloned());
+    }
+    Some(announced)
 }
 
 pub fn valid_service(name: &str) -> bool {
@@ -580,17 +611,25 @@ impl Store {
             .is_some_and(|p| p.all_hosts && p.services.contains("t3")))
     }
 
-    /// Applies a paired device's announcement of its name, whether it lets this
-    /// device manage it and, when it is reachable, its current address. Unknown
-    /// devices change nothing.
-    pub(crate) fn refresh_peer(
+    /// Applies one announcement from a paired device. Every part is checked before any
+    /// is applied, in one update, so a rejected announcement changes nothing. Unknown
+    /// devices change nothing. Hellos repeat, also on every network change of a phone, so
+    /// an announcement that says nothing new is not written.
+    pub(crate) fn refresh_announcement(
         &self,
         id: &str,
-        name: &str,
-        address: Option<&EndpointAddr>,
-        managed: bool,
-        grants: Option<(&[String], &[String])>,
+        announcement: &Announcement<'_>,
+        now: u64,
     ) -> Result<()> {
+        let Announcement {
+            name,
+            address,
+            managed,
+            grants,
+            routes,
+            bridge_consent,
+            host_routes,
+        } = *announcement;
         ensure!(valid_device_name(name), "invalid device name");
         if let Some(address) = address {
             ensure!(
@@ -606,13 +645,17 @@ impl Store {
                 "invalid announced services"
             );
         }
+        if let Some(routes) = routes {
+            routes::check_gateway_routes(routes)?;
+        }
+        routes::check_host_routes(host_routes)?;
         let address = address.map(sanitize_address);
-        self.update(|state| {
-            let peer = state.peers.get_mut(id).context("unknown peer")?;
+        self.update_peer(id, |peer| {
             peer.name = name.to_owned();
             peer.managed = managed;
-            if let Some(address) = address {
-                peer.address = Some(address);
+            let learned = address.and_then(|a| merged_address(peer.address.as_ref(), a));
+            if learned.is_some() {
+                peer.address = learned;
             }
             // Older devices do not announce grants; then what is known stays.
             if let Some((services, public)) = grants {
@@ -623,8 +666,24 @@ impl Store {
                     .cloned()
                     .collect();
             }
-            Ok(())
+            if let Some(routes) = routes {
+                routes::apply_gateway_routes(peer, routes, now);
+            }
+            routes::apply_host_routes(peer, bridge_consent, host_routes);
         })
+    }
+
+    /// Changes one peer, and touches the disk only if that peer actually changed.
+    pub(crate) fn update_peer(&self, id: &str, change: impl FnOnce(&mut Peer)) -> Result<()> {
+        let _lock = self.lock()?;
+        let mut state = self.read()?;
+        let peer = state.peers.get_mut(id).context("unknown peer")?;
+        let before = serde_json::to_value(&*peer)?;
+        change(peer);
+        if serde_json::to_value(&*peer)? != before {
+            self.write(&state)?;
+        }
+        Ok(())
     }
 
     pub fn revoke(&self, peer: &str) -> Result<()> {

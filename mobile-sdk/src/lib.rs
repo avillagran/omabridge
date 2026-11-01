@@ -40,7 +40,7 @@ fn call(v: Value) -> Result<Value> {
     let op = text(&v, "op")?;
     if op == "capabilities" {
         return Ok(
-            json!({"abi":1,"features":["mobile-admin-v1","shared-drafts-v1","service-request-v1"]}),
+            json!({"abi":1,"features":["mobile-admin-v1","shared-drafts-v1","service-request-v1","host-refresh-v1","route-fallback-v1"]}),
         );
     }
     if op == "open" {
@@ -167,6 +167,26 @@ fn call(v: Value) -> Result<Value> {
         "refresh" => {
             let manager = s.manager.as_mut().context("bridge_not_selected")?;
             s.runtime.block_on(manager.refresh(&s.client))
+        }
+        // The answer comes from the device the connection authenticated, under its
+        // paired identity. Addresses are hints: this grants nothing and reveals none.
+        "hostRefresh" => {
+            let peer = match v.get("peer") {
+                Some(peer) => peer.as_str().context("invalid_input")?.to_owned(),
+                None => (s.manager.as_ref().context("bridge_not_selected")?)
+                    .bridge()
+                    .id
+                    .to_string(),
+            };
+            let found = omabridge::find_peer(&s.store, &peer).map_err(anyhow::Error::msg)?;
+            let before = found.address.clone().context("peer_address_missing")?;
+            let answer = s.runtime.block_on(s.client.refresh_address(&found));
+            let found = omabridge::find_peer(&s.store, &peer).map_err(anyhow::Error::msg)?;
+            let current = found.address.context("peer_address_missing")?;
+            if let Some(manager) = s.manager.as_mut() {
+                manager.follow_address(&current);
+            }
+            Ok(json!({"reachable":answer.is_ok(),"changed":current != before}))
         }
         "enroll" => {
             let now = unix_millis()?;
@@ -331,6 +351,8 @@ mod tests {
     use omabridge::{NetOptions, Node};
     use std::{collections::BTreeMap, ffi::CStr, time::Duration};
 
+    const ENVIRONMENT: &str = "00000000-0000-4000-8000-000000000002";
+
     pub(super) fn abi(input: Value) -> Value {
         let bytes = serde_json::to_vec(&input).unwrap();
         unsafe {
@@ -340,9 +362,148 @@ mod tests {
             value
         }
     }
+    fn node_at(
+        runtime: &tokio::runtime::Runtime,
+        owner: &Store,
+        port: u16,
+        relay: omabridge::Relay,
+    ) -> Result<Node> {
+        let options = NetOptions {
+            bind: format!("127.0.0.1:{port}").parse()?,
+            relay,
+            compress_t3: false,
+        };
+        let services = BTreeMap::from([("t3".into(), "127.0.0.1:9".parse()?)]);
+        let node = runtime.block_on(Node::start(owner.clone(), services, options))?;
+        owner.publish_endpoint(&node.addr(), &["t3".into()])?;
+        Ok(node)
+    }
+
+    fn free_port() -> Result<u16> {
+        Ok(std::net::UdpSocket::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port())
+    }
+
+    /// A bridge that moves to a relay on the same port, as a LAN bridge does when it
+    /// changes relay: a phone that can still dial it learns the new route, with no
+    /// new pairing, and keeps the same identity and catalog.
+    #[test]
+    fn host_refresh_learns_a_moved_bridge_without_pairing_again() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        let owner = Store::open(&dir.path().join("owner"), "owner")?;
+        let port = free_port()?;
+        let node = node_at(&runtime, &owner, port, omabridge::Relay::Disabled)?;
+        let state = dir.path().join("mobile");
+        let opened = abi(json!({"op":"open","stateDir":state,"directOnly":true}));
+        let handle = opened["ok"]["handle"].clone();
+        let phone = opened["ok"]["clientId"].as_str().context("open failed")?;
+        let peer = owner.id()?;
+        assert_eq!(
+            abi(json!({"op":"hostRefresh","handle":handle}))["error"],
+            "bridge_not_selected"
+        );
+        let now = omabridge::unix_time()?;
+        let invite = Invitation {
+            version: 1,
+            address: node.addr(),
+            token: owner.create_invite(&["t3".into()], Duration::from_secs(300), now)?,
+            name: "owner".into(),
+            expires: now + 300,
+            manage: false,
+        };
+        let pair = json!({"op":"pair","handle":handle,"invitation":invite});
+        assert_eq!(abi(pair.clone())["ok"]["approved"], false);
+        owner.approve(phone, now)?;
+        assert_eq!(abi(pair)["ok"]["approved"], true);
+        assert!(
+            abi(json!({"op":"selectBridge","handle":handle,"bridgeId":peer}))["ok"].is_object()
+        );
+        omabridge::catalog::publish_source(
+            &owner,
+            &json!({"version":1,"revision":1,"environments":[{"id":ENVIRONMENT,"name":"HOST","enabled":true}],
+                "endpoints":[],"clients":{phone:[ENVIRONMENT]}}),
+        )?;
+        let refresh = json!({"op":"refresh","handle":handle});
+        let host_refresh = json!({"op":"hostRefresh","handle":handle});
+        let stored_at = |handle: &Value| {
+            let peers = abi(json!({"op":"peers","handle":handle}));
+            let peers = peers["ok"]["peers"].as_array().unwrap();
+            assert_eq!(peers.len(), 1, "one identity, one row");
+            assert_eq!(peers[0]["id"], peer);
+            (
+                peers[0]["address"]["addrs"].clone(),
+                peers[0]["remote_services"].clone(),
+            )
+        };
+        let stored = || stored_at(&handle);
+        assert_eq!(abi(refresh.clone())["ok"]["status"], "available");
+        let unmoved = abi(host_refresh.clone());
+        assert_eq!(unmoved["ok"], json!({"reachable":true,"changed":false}));
+
+        // Same port, public relay: reachable as before, now with the route for outside.
+        runtime.block_on(node.shutdown());
+        let relay = "https://relay.example.net/";
+        let node = node_at(
+            &runtime,
+            &owner,
+            port,
+            omabridge::Relay::Custom(relay.parse()?),
+        )?;
+        let (before, services) = stored();
+        assert!(!before.to_string().contains(relay));
+        let moved = abi(host_refresh.clone());
+        assert_eq!(moved["ok"], json!({"reachable":true,"changed":true}));
+        assert!(stored().0.to_string().contains(relay));
+        assert_eq!(stored().1, services, "no grant changes");
+        // The catalog pinned the address it was opened with, and renewal dials that.
+        let pinned = |handle: &Value| {
+            let sessions = registry().lock().unwrap();
+            let bridge = sessions[&handle.as_u64().unwrap()]
+                .manager
+                .as_ref()
+                .unwrap()
+                .bridge();
+            format!("{:?}", bridge.addrs).contains("relay.example.net")
+        };
+        assert!(pinned(&handle));
+        assert!(
+            !moved.to_string().contains("example.net"),
+            "no address in results"
+        );
+
+        // A restart reads what the refresh stored, with no new pairing.
+        assert!(abi(json!({"op":"close","handle":handle}))["ok"].is_object());
+        let opened = abi(json!({"op":"open","stateDir":state,"directOnly":true}));
+        let handle = opened["ok"]["handle"].clone();
+        assert_eq!(opened["ok"]["bridgeId"], peer);
+        let refresh = json!({"op":"refresh","handle":handle});
+        let host_refresh = json!({"op":"hostRefresh","handle":handle});
+        assert_eq!(abi(refresh.clone())["ok"]["status"], "available");
+        assert!(pinned(&handle));
+
+        // A device that was revoked learns nothing, and what is stored stays.
+        owner.revoke(phone)?;
+        let (kept, _) = stored_at(&handle);
+        assert_eq!(
+            abi(host_refresh)["ok"],
+            json!({"reachable":false,"changed":false})
+        );
+        assert_eq!(stored_at(&handle).0, kept);
+        assert!(abi(json!({"op":"close","handle":handle}))["ok"].is_object());
+        runtime.block_on(node.shutdown());
+        Ok(())
+    }
+
     #[test]
     fn mobile_abi_admin_and_drafts_over_real_peer() -> Result<()> {
-        assert_eq!(abi(json!({"op":"capabilities"}))["ok"]["abi"], 1);
+        let capabilities = abi(json!({"op":"capabilities"}));
+        assert_eq!(capabilities["ok"]["abi"], 1);
+        for feature in ["host-refresh-v1", "route-fallback-v1"] {
+            let features = capabilities["ok"]["features"].as_array().unwrap();
+            assert!(features.contains(&json!(feature)));
+        }
         let dir = tempfile::tempdir()?;
         let runtime = tokio::runtime::Runtime::new()?;
         let owner = Store::open(&dir.path().join("owner"), "owner")?;
