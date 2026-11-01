@@ -478,7 +478,13 @@ fn sync_key(store: &Store) -> Option<(String, Vec<SyncEntry>, Vec<crate::gateway
 
 /// While serving: announce at start, within seconds of a rename or a new
 /// reachable pairing, and every SYNC_INTERVAL.
-async fn sync_loop(endpoint: Endpoint, options: NetOptions, store: Store, relay: Option<RelayUrl>) {
+async fn sync_loop(
+    endpoint: Endpoint,
+    options: NetOptions,
+    store: Store,
+    relay: Option<RelayUrl>,
+    standalone: bool,
+) {
     let mut announced = None;
     let mut announced_address = None;
     let mut last = tokio::time::Instant::now();
@@ -486,7 +492,7 @@ async fn sync_loop(endpoint: Endpoint, options: NetOptions, store: Store, relay:
     let mut retry: Option<tokio::time::Instant> = None;
     let mut backoff = RETRY_FIRST;
     loop {
-        if crate::manage::rollback_due(store.root(), &crate::units::Systemctl) {
+        if standalone && crate::manage::rollback_due(store.root(), &crate::units::Systemctl) {
             // The unit restarts with the previous relay.
             return;
         }
@@ -1433,8 +1439,11 @@ pub struct NodeConfig {
     pub backend: Option<Arc<dyn crate::manage::ServeBackend>>,
     pub control_socket: bool,
     pub gateways: bool,
+    pub gateway_runtime: Option<crate::gateway::GatewayRuntime>,
     pub relay_host: bool,
     pub sync: bool,
+    /// Legacy relay rollback may restart a systemd unit. Never enable in a host.
+    pub standalone_supervision: bool,
 }
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -1442,8 +1451,10 @@ impl Default for NodeConfig {
             backend: None,
             control_socket: true,
             gateways: true,
+            gateway_runtime: None,
             relay_host: true,
             sync: true,
+            standalone_supervision: true,
         }
     }
 }
@@ -1453,8 +1464,10 @@ impl NodeConfig {
             backend: None,
             control_socket: true,
             gateways: false,
+            gateway_runtime: None,
             relay_host: false,
-            sync: false,
+            sync: true,
+            standalone_supervision: false,
         }
     }
 }
@@ -1607,7 +1620,10 @@ impl Node {
             "server reservation belongs to another identity"
         );
         ensure!(
-            !services.is_empty() && services.len() <= 32,
+            services.len() <= 32
+                && (!services.is_empty()
+                    || config.gateway_runtime.is_some()
+                    || (config.backend.is_some() && config.relay_host)),
             "publish 1..32 services"
         );
         for (name, target) in &services {
@@ -1641,6 +1657,7 @@ impl Node {
                 options.clone(),
                 store.clone(),
                 relay.clone(),
+                config.standalone_supervision,
             ),
         ));
         let control = tokio::spawn(enabled(
@@ -1659,7 +1676,12 @@ impl Node {
         ));
         let gateways = tokio::spawn(enabled(
             config.gateways,
-            crate::gateway::gateway_loop(store.clone(), endpoint.clone(), options.clone()),
+            crate::gateway::gateway_loop_configured(
+                store.clone(),
+                endpoint.clone(),
+                options.clone(),
+                config.gateway_runtime,
+            ),
         ));
         let announce = relay.clone();
         let listener = endpoint.clone();

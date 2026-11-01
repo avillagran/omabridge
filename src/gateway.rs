@@ -21,6 +21,28 @@ use std::{
 };
 use tokio::{net::TcpListener, sync::Semaphore, task::JoinHandle, time::timeout};
 
+/// Explicit host resources. Embedded hosts never discover machine certificates.
+#[derive(Clone)]
+pub struct GatewayRuntime {
+    pub bind: std::net::IpAddr,
+    pub certificates: BTreeMap<String, (PathBuf, PathBuf)>,
+    pub local: BTreeMap<String, Arc<dyn crate::LocalService>>,
+    pub backend: Arc<dyn crate::manage::ServeBackend>,
+}
+impl GatewayRuntime {
+    fn allowed(&self, gateway: &Gateway, store: &Store) -> bool {
+        store.id().is_ok_and(|id| gateway.peer == id)
+            && self.local.contains_key(&gateway.service)
+            && self.backend.allows(&gateway.service)
+    }
+}
+fn certificate(host: &str, runtime: Option<&GatewayRuntime>) -> Option<(PathBuf, PathBuf)> {
+    match runtime {
+        Some(runtime) => runtime.certificates.get(host).cloned(),
+        None => crate::hosting::certificate_for(host),
+    }
+}
+
 const CONFIG: &str = "gateways.json";
 const STATUS: &str = "gateways.status.json";
 pub const MAX_GATEWAYS: usize = 16;
@@ -122,18 +144,19 @@ impl rustls::server::ResolvesServerCert for ByName {
 /// also drops its open connections.
 type Signature = Vec<(Gateway, Option<SystemTime>, Option<PathBuf>, bool)>;
 
-fn signature(gateways: &[Gateway], store: &Store) -> Signature {
+fn signature(gateways: &[Gateway], store: &Store, runtime: Option<&GatewayRuntime>) -> Signature {
     let peers = store.peers().unwrap_or_default();
     gateways
         .iter()
         .map(|gateway| {
             // Revoking the target or withdrawing its public grant ends the gateway.
-            let allowed = peers.iter().any(|peer| {
-                peer.id == gateway.peer
-                    && peer.remote_services.contains(&gateway.service)
-                    && peer.remote_public.contains(&gateway.service)
-            });
-            let cert = crate::hosting::certificate_for(&gateway.host).map(|(cert, _)| cert);
+            let allowed = runtime.is_some_and(|r| r.allowed(gateway, store))
+                || peers.iter().any(|peer| {
+                    peer.id == gateway.peer
+                        && peer.remote_services.contains(&gateway.service)
+                        && peer.remote_public.contains(&gateway.service)
+                });
+            let cert = certificate(&gateway.host, runtime).map(|(cert, _)| cert);
             let modified = cert.as_ref().and_then(|cert| {
                 std::fs::metadata(cert)
                     .and_then(|meta| meta.modified())
@@ -157,6 +180,7 @@ async fn start_port(
     store: &Store,
     endpoint: &Endpoint,
     options: &NetOptions,
+    runtime: Option<&GatewayRuntime>,
 ) -> (Option<JoinHandle<()>>, BTreeMap<String, GatewayStatus>) {
     let mut keys = BTreeMap::new();
     let mut targets: BTreeMap<String, (String, String)> = BTreeMap::new();
@@ -164,11 +188,12 @@ async fn start_port(
     let peers = store.peers().unwrap_or_default();
     for gateway in gateways {
         // Only while the target device lets this one expose the service publicly.
-        let allowed = peers.iter().any(|peer| {
-            peer.id == gateway.peer
-                && peer.remote_services.contains(&gateway.service)
-                && peer.remote_public.contains(&gateway.service)
-        });
+        let allowed = runtime.is_some_and(|r| r.allowed(gateway, store))
+            || peers.iter().any(|peer| {
+                peer.id == gateway.peer
+                    && peer.remote_services.contains(&gateway.service)
+                    && peer.remote_public.contains(&gateway.service)
+            });
         if !allowed || !PUBLIC_SERVICES.contains(&gateway.service.as_str()) {
             statuses.insert(
                 gateway.url(),
@@ -179,7 +204,7 @@ async fn start_port(
             );
             continue;
         }
-        let key = crate::hosting::certificate_for(&gateway.host).and_then(|(cert, key)| {
+        let key = certificate(&gateway.host, runtime).and_then(|(cert, key)| {
             let (cert, key) = (
                 std::fs::canonicalize(cert).ok()?,
                 std::fs::canonicalize(key).ok()?,
@@ -227,7 +252,12 @@ async fn start_port(
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(ByName(keys)));
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-    let Ok(listener) = TcpListener::bind(("0.0.0.0", port)).await else {
+    let Ok(listener) = TcpListener::bind((
+        runtime.map_or(std::net::Ipv4Addr::UNSPECIFIED.into(), |r| r.bind),
+        port,
+    ))
+    .await
+    else {
         failed(&mut statuses, "port");
         return (None, statuses);
     };
@@ -251,6 +281,7 @@ async fn start_port(
             .collect(),
     );
     let targets = Arc::new(targets);
+    let runtime = runtime.cloned();
     let per_address: Arc<std::sync::Mutex<BTreeMap<std::net::IpAddr, usize>>> = Arc::default();
     let task = tokio::spawn(async move {
         let capacity = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -271,6 +302,7 @@ async fn start_port(
                     }
                     let (acceptor, targets, store, endpoint, options, per_address, streams) =
                         (acceptor.clone(), targets.clone(), store.clone(), endpoint.clone(), options.clone(), per_address.clone(), streams.clone());
+                    let runtime = runtime.clone();
                     workers.spawn(async move {
                         let _permit = permit;
                         let _slot = AddressSlot(per_address, client);
@@ -280,16 +312,45 @@ async fn start_port(
                         let Some(name) = tls.get_ref().1.server_name().map(|name| name.to_ascii_lowercase()) else { return };
                         let Some((peer, service)) = targets.get(name.trim_end_matches('.')) else { return };
                         let Some(Ok(_stream)) = streams.get(name.trim_end_matches('.')).map(|limit| limit.clone().try_acquire_owned()) else { return };
-                        // The target device's address comes from this device's own state.
-                        let Some(addr) = store.peers().ok().and_then(|peers| {
-                            peers.into_iter().find(|item| &item.id == peer).and_then(|item| item.address)
-                        }) else { return };
                         // Nothing reaches the target until the client says something.
                         let mut first = vec![0u8; 16 * 1024];
                         let Ok(Ok(read)) = timeout(FIRST_DATA, tokio::io::AsyncReadExt::read(&mut tls, &mut first)).await else { return };
                         if read == 0 {
                             return;
                         }
+                        if let Some(runtime) = &runtime {
+                            if store.id().is_ok_and(|id| peer == &id) {
+                                if !runtime.backend.allows(service) { return; }
+                                let Some(local) = runtime.local.get(service).cloned() else { return };
+                                let (mut client, server) = tokio::io::duplex(32 * 1024);
+                                let serving = local.serve(server, crate::PeerInfo {
+                                    remote_id: store.id().unwrap_or_default(), service: service.clone(), public: true,
+                                });
+                                let activity = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                                let started = tokio::time::Instant::now();
+                                let mut watched = Watched { inner: tls, activity: activity.clone(), started };
+                                let transfer = async {
+                                    use tokio::io::AsyncWriteExt;
+                                    client.write_all(&first[..read]).await?;
+                                    tokio::io::copy_bidirectional(&mut watched, &mut client).await
+                                };
+                                tokio::pin!(serving, transfer);
+                                let mut serving_done = false;
+                                let mut check = tokio::time::interval(Duration::from_secs(1));
+                                loop { tokio::select! {
+                                    _ = &mut serving, if !serving_done => serving_done = true,
+                                    _ = &mut transfer => break,
+                                    _ = check.tick() => {
+                                        let last = Duration::from_millis(activity.load(std::sync::atomic::Ordering::Relaxed));
+                                        if !runtime.backend.allows(service) || started.elapsed().saturating_sub(last) > IDLE { break; }
+                                    },
+                                } }
+                                return;
+                            }
+                        }
+                        let Some(addr) = store.peers().ok().and_then(|peers| {
+                            peers.into_iter().find(|item| &item.id == peer).and_then(|item| item.address)
+                        }) else { return };
                         let Ok(Ok(mut pipe)) = timeout(OPEN, open_with(&endpoint, &options, &addr, service, true)).await else { return };
                         if pipe.write_prefix(&first[..read]).await.is_err() {
                             return;
@@ -327,6 +388,30 @@ type Running = (
     Signature,
     BTreeMap<String, GatewayStatus>,
 );
+
+// Aborting the node's gateway supervisor must also release its listeners.
+#[derive(Default)]
+struct Listeners(BTreeMap<u16, Running>);
+impl std::ops::Deref for Listeners {
+    type Target = BTreeMap<u16, Running>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for Listeners {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for Listeners {
+    fn drop(&mut self) {
+        for (task, _, _) in self.0.values() {
+            if let Some(task) = task {
+                task.abort();
+            }
+        }
+    }
+}
 
 /// A client stream that records when bytes last moved either way.
 struct Watched<S> {
@@ -404,8 +489,16 @@ impl Drop for AddressSlot {
 /// Runs inside a device's server: starts, stops and reloads gateways within
 /// seconds of a configuration change or a renewed certificate.
 pub async fn gateway_loop(store: Store, endpoint: Endpoint, options: NetOptions) {
+    gateway_loop_configured(store, endpoint, options, None).await;
+}
+pub async fn gateway_loop_configured(
+    store: Store,
+    endpoint: Endpoint,
+    options: NetOptions,
+    runtime: Option<GatewayRuntime>,
+) {
     let root = store.root().to_path_buf();
-    let mut running: BTreeMap<u16, Running> = BTreeMap::new();
+    let mut running = Listeners::default();
     let mut reported: Option<BTreeMap<String, GatewayStatus>> = None;
     loop {
         let mut wanted: BTreeMap<u16, Vec<Gateway>> = BTreeMap::new();
@@ -416,9 +509,9 @@ pub async fn gateway_loop(store: Store, endpoint: Endpoint, options: NetOptions)
             .iter()
             .filter_map(|(port, (task, sig, _))| {
                 let keep = task.as_ref().is_some_and(|task| !task.is_finished())
-                    && wanted
-                        .get(port)
-                        .is_some_and(|gateways| signature(gateways, &store) == *sig);
+                    && wanted.get(port).is_some_and(|gateways| {
+                        signature(gateways, &store, runtime.as_ref()) == *sig
+                    });
                 (!keep).then_some(*port)
             })
             .collect();
@@ -432,9 +525,16 @@ pub async fn gateway_loop(store: Store, endpoint: Endpoint, options: NetOptions)
         }
         for (port, gateways) in &wanted {
             if !running.contains_key(port) {
-                let sig = signature(gateways, &store);
-                let (task, statuses) =
-                    start_port(*port, gateways, &store, &endpoint, &options).await;
+                let sig = signature(gateways, &store, runtime.as_ref());
+                let (task, statuses) = start_port(
+                    *port,
+                    gateways,
+                    &store,
+                    &endpoint,
+                    &options,
+                    runtime.as_ref(),
+                )
+                .await;
                 running.insert(*port, (task, sig, statuses));
             }
         }
