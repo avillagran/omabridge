@@ -191,6 +191,10 @@ status:"native_authorized", baseUrl, provenance}`. `pair` also returns `allHosts
 - `renew`: native rows within seven days of ending, or already ended. Use `hostPair`
   again: T3 sessions last 30 days and do not extend, so a renewal is a new session.
 
+Renewal needs the bridge, and the bridge can move after pairing. `hostRefresh` keeps
+the phone's address current under the paired identity: see
+[Bridge address refresh](mobile-administration.md#bridge-address-refresh-host-refresh-v1).
+
 Rows must pass their local `status`. A row with `native_authorized` or
 `native_expired`, with `authorizationExpiresAt`, is exempt from the five-minute
 rule: projection never turns it `discovered` or `expired`, never lists it in

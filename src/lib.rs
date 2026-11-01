@@ -267,6 +267,25 @@ pub(crate) fn sanitize_address(address: &EndpointAddr) -> EndpointAddr {
     clean
 }
 
+/// Addresses are hints, so an announcement must not lose the way back. One with
+/// nothing usable changes nothing. One without a relay, as when the peer's home
+/// relay was down for a moment, keeps the known relay: from outside the LAN it can
+/// be the only route, and a dead hint costs one failed path.
+fn merged_address(
+    known: Option<&EndpointAddr>,
+    mut announced: EndpointAddr,
+) -> Option<EndpointAddr> {
+    let relay = |addr: &&iroh::TransportAddr| matches!(addr, iroh::TransportAddr::Relay(_));
+    if announced.addrs.is_empty() {
+        return None;
+    }
+    if !announced.addrs.iter().any(|addr| relay(&addr)) {
+        let kept = known.into_iter().flat_map(|known| known.addrs.iter());
+        announced.addrs.extend(kept.filter(relay).cloned());
+    }
+    Some(announced)
+}
+
 pub fn valid_service(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -611,8 +630,9 @@ impl Store {
             let peer = state.peers.get_mut(id).context("unknown peer")?;
             peer.name = name.to_owned();
             peer.managed = managed;
-            if let Some(address) = address {
-                peer.address = Some(address);
+            let learned = address.and_then(|a| merged_address(peer.address.as_ref(), a));
+            if learned.is_some() {
+                peer.address = learned;
             }
             // Older devices do not announce grants; then what is known stays.
             if let Some((services, public)) = grants {

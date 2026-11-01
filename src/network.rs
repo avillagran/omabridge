@@ -364,7 +364,7 @@ async fn hello(
     own: Option<EndpointAddr>,
 ) -> Result<()> {
     let addr = peer.address.as_ref().context("peer address unknown")?;
-    let (_pipe, response) = request(
+    let (pipe, response) = request(
         endpoint,
         options,
         addr,
@@ -389,7 +389,11 @@ async fn hello(
             bridge_consent,
             host_routes,
         } => {
-            ensure!(address.id == addr.id, "peer answered for another device");
+            // The connection proves who answered; the addresses are only its hints.
+            ensure!(
+                pipe.connection.remote_id() == addr.id && address.id == addr.id,
+                "peer answered for another device"
+            );
             store.refresh_peer(
                 &peer.id,
                 &name,
@@ -2156,6 +2160,11 @@ impl Client {
     pub async fn announce(&self, own: Option<EndpointAddr>) -> Result<(usize, usize)> {
         hello_all(&self.endpoint, &self.options, &self.store, own).await
     }
+    /// Learns one paired device's current address from the device itself, over the
+    /// connection it authenticates. On any failure what is stored stays as it was.
+    pub async fn refresh_address(&self, peer: &crate::Peer) -> Result<()> {
+        hello(&self.endpoint, &self.options, &self.store, peer, None).await
+    }
     pub async fn pair(&self, invite: &Invitation, name: &str, now: u64) -> Result<PairDecision> {
         pair_with(
             &self.endpoint,
@@ -2275,6 +2284,104 @@ mod recovery_tests {
                 ..
             }
         ));
+        Ok(())
+    }
+
+    /// Answers one `Hello` over real QUIC with the address `announce` makes of its own.
+    fn answer_hello(
+        endpoint: Endpoint,
+        announce: impl FnOnce(EndpointAddr) -> EndpointAddr + Send + 'static,
+    ) -> JoinHandle<Result<()>> {
+        tokio::spawn(async move {
+            let connection = endpoint.accept().await.context("no peer")?.await?;
+            let (mut send, mut recv) = connection.accept_bi().await?;
+            let _: Request = read_header(&mut recv).await?;
+            let response = Response::Hello {
+                name: "bridge".into(),
+                address: announce(endpoint.addr()),
+                admin: false,
+                grants: None,
+                routes: None,
+                bridge_consent: false,
+                host_routes: Vec::new(),
+            };
+            write_header(&mut send, &response).await?;
+            send.finish()?;
+            let _ = timeout(DENIED_LINGER, connection.closed()).await;
+            Ok(())
+        })
+    }
+
+    /// Identity stays the paired key: an answer is a hint from the authenticated
+    /// device, and one that would lose the way back changes nothing.
+    #[tokio::test]
+    async fn a_refresh_trusts_the_paired_identity_and_keeps_the_way_back() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let phone = Store::open(&dir.path().join("phone"), "phone")?;
+        let bridge = Store::open(&dir.path().join("bridge"), "bridge")?;
+        let endpoint = endpoint(&bridge, &NetOptions::loopback(), true).await?;
+        let relay = |url: &str| TransportAddr::Relay(url.parse().unwrap());
+        let old_relay = relay("https://old-relay.example.net/");
+        let new_relay = relay("https://new-relay.example.net/");
+        let moved: TransportAddr = TransportAddr::Ip("203.0.113.7:4433".parse()?);
+        let mut known = endpoint.addr();
+        known.addrs.insert(old_relay.clone());
+        let id = known.id.to_string();
+        let client = Client::new(phone.clone(), NetOptions::loopback()).await?;
+        let stored = || find_peer(&phone, &id).unwrap().address.unwrap();
+
+        // Another device's address is refused, even from the paired connection.
+        phone.remember_peer(&known, "bridge", &["t3".into()], false)?;
+        let server = answer_hello(endpoint.clone(), |_| {
+            EndpointAddr::new(iroh::SecretKey::generate().public())
+        });
+        let peer = find_peer(&phone, &id).unwrap();
+        assert!(client.refresh_address(&peer).await.is_err());
+        server.await??;
+        assert_eq!(stored(), known);
+
+        // An answer with nothing usable keeps what is known.
+        let server = answer_hello(endpoint.clone(), |mut own| {
+            own.addrs.clear();
+            own
+        });
+        client.refresh_address(&peer).await?;
+        server.await??;
+        assert_eq!(stored(), known);
+
+        // One without a relay keeps the known relay: it can be the only way in.
+        let keep = moved.clone();
+        let server = answer_hello(endpoint.clone(), move |mut own| {
+            own.addrs.insert(keep);
+            own
+        });
+        client.refresh_address(&peer).await?;
+        server.await??;
+        assert!(stored().addrs.contains(&moved) && stored().addrs.contains(&old_relay));
+
+        // A new relay replaces the old one under the same identity.
+        let next = new_relay.clone();
+        let server = answer_hello(endpoint.clone(), move |mut own| {
+            own.addrs.insert(next);
+            own
+        });
+        let peer = find_peer(&phone, &id).unwrap();
+        client.refresh_address(&peer).await?;
+        server.await??;
+        assert!(stored().addrs.contains(&new_relay) && !stored().addrs.contains(&old_relay));
+        assert_eq!(stored().id, known.id);
+
+        // A different key at the paired address does not authenticate at all.
+        let impostor = Store::open(&dir.path().join("impostor"), "impostor")?;
+        let impostor = super::endpoint(&impostor, &NetOptions::loopback(), true).await?;
+        let mut swapped = impostor.addr();
+        swapped.id = known.id;
+        phone.remember_peer(&swapped, "bridge", &["t3".into()], false)?;
+        let before = stored();
+        let peer = find_peer(&phone, &id).unwrap();
+        assert!(client.refresh_address(&peer).await.is_err());
+        assert_eq!(stored(), before);
+        client.close().await;
         Ok(())
     }
 

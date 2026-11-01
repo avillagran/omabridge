@@ -6,7 +6,7 @@ explicit per-peer `admin` grant (`manage` in the UI). Pairing, `t3`, all-hosts o
 receiving device on every request. Do not infer it from cached announcements.
 
 C ABI stays v1: signatures and existing operations are unchanged. Query
-`{"op":"capabilities"}` (no handle) for `{abi:1,features:["mobile-admin-v1","shared-drafts-v1","service-request-v1"]}`.
+`{"op":"capabilities"}` (no handle) for `{abi:1,features:["mobile-admin-v1","shared-drafts-v1","service-request-v1","host-refresh-v1","route-fallback-v1"]}`.
 Then use the normal `open`/`pair` flow. All following calls use that handle:
 
 * `{"op":"peers","handle":N}` returns the phone's identity and paired peers,
@@ -64,6 +64,44 @@ and show those reasons. Render inline invitation JSON with the existing invitati
 QR/share flow, and discard it after use. All-hosts approval must direct the user
 to the owner device. See [shared drafts](shared-drafts.md) for the separate grant
 and composer repository integration; no Android application code is changed here.
+
+## Bridge address refresh (host-refresh-v1)
+
+A phone keeps the address it paired with, and a bridge can move: another relay, a
+new home relay, new interfaces. `hostRefresh` asks the bridge for its current
+address, without pairing again:
+
+```json
+{"op":"hostRefresh","handle":1}
+{"op":"hostRefresh","handle":1,"peer":"<device-id>"}
+```
+
+Without `peer` it asks the selected bridge (`bridge_not_selected` if there is none).
+The result is `{ok:{reachable:bool,changed:bool}}`. It never contains an address.
+`reachable:false` covers a bridge out of reach, one that refused and one whose
+answer was rejected; what is stored stays as it was in all three. It is a routine
+result, not an error.
+
+* It is one authenticated `Hello` on the phone's own endpoint, bounded by the usual
+  8-second setup deadline, with no retry. Bridges since the first `Hello` already
+  answer it with their live address, so **bridges need no update**.
+* **Identity stays the paired key.** The answer is stored only when the QUIC
+  connection authenticated that key and the announced address names it. An address
+  is a hint: it can only say where to dial, the dial is authenticated again, and it
+  never adds a grant or a peer. Addresses go through the same filter as any
+  announcement.
+* **It cannot lose the way back.** An answer with nothing usable changes nothing,
+  and one without a relay keeps the known relay.
+* It updates the running catalog manager, so `refresh`, `enroll` and `hostPair`
+  (hence renewal) dial the new address at once, and it survives a restart.
+* A refused `Hello` learns nothing: a revoked phone gets no address.
+* An admin phone's `hostRefresh` is a `Hello` like any other, so it also confirms a
+  pending remote `relay-set`.
+
+A phone has to reach the bridge once to learn from it. Move a bridge while the phone
+can still dial it, usually on the LAN, and let it refresh before it leaves. Call this
+from a worker thread after a catalog failure or recovery, on a network change and
+every few minutes while connected, with jitter: SDK calls are serialized.
 
 ## Authenticated service HTTP (service-request-v1)
 

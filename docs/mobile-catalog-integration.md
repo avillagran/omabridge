@@ -61,6 +61,23 @@ authorizes a T3 connection. Projection keys by stable UUID + bridge/client prove
 preserves existing managed local IDs, skips independent rows, and supplies stop IDs on
 withdrawal/expiry/route change. Host-owned drafts/cursors/selections never enter Rust.
 
+## Route fallback for independent rows (route-fallback-v1)
+
+`projection` also returns `routeFallbacks: [{id, baseUrl}]`: rows with no bridge
+provenance and a different URL, whose `environmentId` has a route in the catalog. It
+is computed from the cached catalog too, because an unreachable bridge is when a phone
+needs it most, and it stays empty for withdrawn or denied environments and for routes
+that are not HTTPS. The plan does not touch these rows: no `upserts`, no `stop`.
+
+The host stays on the row's own URL and uses the fallback only while that URL is out
+of reach. Before sending the row's credential it must verify the environment UUID from
+the descriptor over HTTPS; a mismatch or a rejected credential drops the fallback, not
+the row. It returns to the row's URL as soon as that answers again. **The bearer of an
+independent row can reach a URL named by the bridge.** The bridge never sees the bearer,
+but it chooses the name, so this trusts it to the same degree as the routes of its own
+rows. A public T3 descriptor is not proof of possession, so remove the bridge or use
+only rows it manages if that trust is not wanted.
+
 ## Enrollment boundary
 
 `EnrollmentAuthority` is an explicit native embedding interface. Default/CLI nodes have

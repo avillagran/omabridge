@@ -176,12 +176,21 @@ impl CatalogManager {
     pub fn bridge(&self) -> &EndpointAddr {
         &self.bridge
     }
+    /// Follows a newly learned address of the same bridge; another device changes nothing.
+    pub fn follow_address(&mut self, address: &EndpointAddr) {
+        if address.id == self.bridge.id {
+            self.bridge = address.clone();
+        }
+    }
     /// Build a native projection. Independent rows win by stable environment id;
     /// managed rows keep their local id across rename/route change/withdrawal.
     /// A native row (its `status` is `NATIVE_AUTHORIZED` or `NATIVE_EXPIRED`) keeps
     /// its session while the catalog is merely stale; only withdrawal stops it.
     /// `hostEnroll` lists new environments of an all-hosts bridge and `renew` the
     /// native rows due: both are served by `Client::t3_host_pair`, never `enroll`.
+    /// `routeFallbacks` lists independent rows with a route to use while their own URL
+    /// is out of reach. The row and its credential stay untouched: the host checks the
+    /// descriptor over HTTPS before it sends that credential there.
     pub fn projection(&self, local: &Value, now: u64) -> Result<Value> {
         let rows = local.as_array().context("invalid local environments")?;
         let mut upserts = Vec::new();
@@ -189,6 +198,7 @@ impl CatalogManager {
         let mut enroll = Vec::new();
         let mut host_enroll = Vec::new();
         let mut renew = Vec::new();
+        let mut route_fallbacks = Vec::new();
         let bridge = self.bridge.id.to_string();
         let all_hosts = self
             .store
@@ -200,6 +210,21 @@ impl CatalogManager {
                 .as_str()
                 .context("invalid cached identity")?;
             let provenance = format!("bridge:{}:{}", self.bridge.id, self.store.id()?);
+            // A stale catalog still names the route, so this works with the bridge out
+            // of reach; a withdrawal does not.
+            if !self.denied && entry["removed"] != true {
+                let route = best_route(entry);
+                for manual in rows.iter().filter(|r| {
+                    r["environmentId"] == id && r["provenance"].is_null() && r["baseUrl"] != route
+                }) {
+                    if route
+                        .as_str()
+                        .is_some_and(|url| url.starts_with("https://"))
+                    {
+                        route_fallbacks.push(json!({"id":manual["id"],"baseUrl":route}));
+                    }
+                }
+            }
             let row = rows.iter().find(|r| r["environmentId"] == id);
             // A row this client got from a previous bridge moves here and enrolls anew,
             // or it would keep that bridge's label with no credential. Only a bridge
@@ -251,13 +276,7 @@ impl CatalogManager {
             let route = if removed {
                 Value::Null
             } else {
-                entry["routes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .min_by_key(|r| r["priority"].as_u64().unwrap_or(u64::MAX))
-                    .map(|r| r["url"].clone())
-                    .unwrap_or(Value::Null)
+                best_route(entry)
             };
             let keeps_running = status == "authorized" || status == NATIVE_AUTHORIZED;
             if !keeps_running || existing.is_some_and(|r| r["baseUrl"] != route) {
@@ -281,9 +300,20 @@ impl CatalogManager {
             upserts.push(json!({"id":local_id,"environmentId":id,"label":entry["label"],"baseUrl":route,"provenance":provenance,"status":status,"authorizationExpiresAt":authorization_expires_at}));
         }
         Ok(
-            json!({"upserts":upserts,"stop":stop,"enroll":enroll,"hostEnroll":host_enroll,"renew":renew}),
+            json!({"upserts":upserts,"stop":stop,"enroll":enroll,"hostEnroll":host_enroll,"renew":renew,"routeFallbacks":route_fallbacks}),
         )
     }
+}
+
+/// The preferred route of a catalog entry, or null.
+fn best_route(entry: &Value) -> Value {
+    entry["routes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .min_by_key(|r| r["priority"].as_u64().unwrap_or(u64::MAX))
+        .map(|r| r["url"].clone())
+        .unwrap_or(Value::Null)
 }
 
 #[cfg(test)]
@@ -406,6 +436,76 @@ mod tests {
         assert_eq!(plan["stop"], json!(["row"]));
         assert!(plan["upserts"][0]["authorizationExpiresAt"].is_null());
         assert_eq!(plan["renew"], json!([]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_manual_row_is_offered_the_catalog_route_and_stays_independent() -> Result<()> {
+        let lan = "http://192.168.1.10:3773";
+        let manual = |id: &str, url: &str| json!({"id":id,"environmentId":ENV,"baseUrl":url});
+        let offered = json!([{"id":"lan","baseUrl":"https://host.example.net/"}]);
+
+        let dir = tempfile::tempdir()?;
+        let fresh = manager(dir.path(), true, false, true);
+        let plan = fresh.projection(&json!([manual("lan", lan)]), NOW)?;
+        assert_eq!(plan["routeFallbacks"], offered);
+        assert_eq!(plan["upserts"], json!([]), "the row stays independent");
+        assert_eq!(plan["stop"], json!([]));
+
+        // A stale catalog is what an unreachable bridge leaves behind.
+        let dir = tempfile::tempdir()?;
+        let stale = manager(dir.path(), true, false, false);
+        let plan = stale.projection(&json!([manual("lan", lan)]), NOW)?;
+        assert_eq!(plan["routeFallbacks"], offered);
+
+        // Every matching manual row, also beside the bridge's own row.
+        let provenance = format!("bridge:{}:{}", fresh.bridge.id, fresh.store.id()?);
+        let mut own = native(&fresh, NATIVE_AUTHORIZED, NOW + 29 * DAY);
+        own[0]["provenance"] = json!(provenance);
+        own.as_array_mut().unwrap().push(manual("lan", lan));
+        let plan = fresh.projection(&own, NOW)?;
+        assert_eq!(plan["routeFallbacks"], offered);
+
+        // Nothing to offer: same URL, other server, a row someone else owns.
+        let mut owned = manual("row", lan);
+        owned["provenance"] = json!("bridge:old:someone-else");
+        let mut other = manual("other", lan);
+        other["environmentId"] = json!("00000000-0000-4000-8000-000000000003");
+        let rows = json!([manual("same", "https://host.example.net/"), owned, other]);
+        assert_eq!(fresh.projection(&rows, NOW)?["routeFallbacks"], json!([]));
+
+        // A withdrawal, a denial or a plain-HTTP route offers nothing.
+        let dir = tempfile::tempdir()?;
+        let gone = manager(dir.path(), true, true, true);
+        let plan = gone.projection(&json!([manual("lan", lan)]), NOW)?;
+        assert_eq!(plan["routeFallbacks"], json!([]));
+        let dir = tempfile::tempdir()?;
+        let mut denied = manager(dir.path(), true, false, true);
+        denied.denied = true;
+        let plan = denied.projection(&json!([manual("lan", lan)]), NOW)?;
+        assert_eq!(plan["routeFallbacks"], json!([]));
+        let dir = tempfile::tempdir()?;
+        let mut plain = manager(dir.path(), true, false, true);
+        plain.cache["environments"][0]["routes"][0]["url"] = json!("http://host.example.net/");
+        let plan = plain.projection(&json!([manual("lan", lan)]), NOW)?;
+        assert_eq!(plan["routeFallbacks"], json!([]));
+        Ok(())
+    }
+
+    #[test]
+    fn the_manager_follows_only_its_own_bridge() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut manager = manager(dir.path(), true, false, true);
+        let id = manager.bridge.id;
+        let moved = EndpointAddr {
+            id,
+            addrs: [iroh::TransportAddr::Ip("203.0.113.7:4433".parse()?)].into(),
+        };
+        manager.follow_address(&moved);
+        assert_eq!(manager.bridge, moved);
+        let other = EndpointAddr::new(iroh::SecretKey::generate().public());
+        manager.follow_address(&other);
+        assert_eq!(manager.bridge, moved, "another identity changes nothing");
         Ok(())
     }
 
