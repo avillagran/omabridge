@@ -1,4 +1,4 @@
-use crate::{PairDecision, RuntimeReservation, Store, valid_service};
+use crate::{Announcement, PairDecision, RuntimeReservation, Store, valid_service};
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{
     Endpoint, EndpointAddr, RelayMode, RelayUrl, TransportAddr,
@@ -394,17 +394,19 @@ async fn hello(
                 pipe.connection.remote_id() == addr.id && address.id == addr.id,
                 "peer answered for another device"
             );
-            store.refresh_peer(
+            store.refresh_announcement(
                 &peer.id,
-                &name,
-                Some(&address),
-                admin,
-                grants.as_ref().map(Grants::pair),
+                &Announcement {
+                    name: &name,
+                    address: Some(&address),
+                    managed: admin,
+                    grants: grants.as_ref().map(Grants::pair),
+                    routes: routes.as_deref(),
+                    bridge_consent,
+                    host_routes: &host_routes,
+                },
+                unix_time()?,
             )?;
-            if let Some(routes) = routes {
-                store.refresh_routes(&peer.id, &routes, unix_time()?)?;
-            }
-            store.refresh_host(&peer.id, bridge_consent, &host_routes)?;
             Ok(())
         }
         _ => bail!("peer refused the announcement"),
@@ -1814,19 +1816,21 @@ async fn serve_connection(
             bridge_consent,
             host_routes,
         } => {
-            let refreshed = store.refresh_peer(
-                &peer,
-                &name,
-                address.as_ref(),
-                admin,
-                grants.as_ref().map(Grants::pair),
-            );
-            let refreshed = refreshed.and_then(|()| match routes {
-                Some(routes) => store.refresh_routes(&peer, &routes, unix_time()?),
-                None => Ok(()),
+            let refreshed = unix_time().and_then(|now| {
+                store.refresh_announcement(
+                    &peer,
+                    &Announcement {
+                        name: &name,
+                        address: address.as_ref(),
+                        managed: admin,
+                        grants: grants.as_ref().map(Grants::pair),
+                        routes: routes.as_deref(),
+                        bridge_consent,
+                        host_routes: &host_routes,
+                    },
+                    now,
+                )
             });
-            let refreshed =
-                refreshed.and_then(|()| store.refresh_host(&peer, bridge_consent, &host_routes));
             let entry = store.peers()?.into_iter().find(|item| item.id == peer);
             let consent = entry.as_ref().is_some_and(|item| item.bridge_consent);
             let own_routes = entry
@@ -2292,18 +2296,28 @@ mod recovery_tests {
         endpoint: Endpoint,
         announce: impl FnOnce(EndpointAddr) -> EndpointAddr + Send + 'static,
     ) -> JoinHandle<Result<()>> {
+        answer_hello_with(endpoint, "bridge", false, Vec::new(), announce)
+    }
+
+    fn answer_hello_with(
+        endpoint: Endpoint,
+        name: &'static str,
+        admin: bool,
+        host_routes: Vec<crate::routes::ServiceRoute>,
+        announce: impl FnOnce(EndpointAddr) -> EndpointAddr + Send + 'static,
+    ) -> JoinHandle<Result<()>> {
         tokio::spawn(async move {
             let connection = endpoint.accept().await.context("no peer")?.await?;
             let (mut send, mut recv) = connection.accept_bi().await?;
             let _: Request = read_header(&mut recv).await?;
             let response = Response::Hello {
-                name: "bridge".into(),
+                name: name.into(),
                 address: announce(endpoint.addr()),
-                admin: false,
+                admin,
                 grants: None,
                 routes: None,
-                bridge_consent: false,
-                host_routes: Vec::new(),
+                bridge_consent: true,
+                host_routes,
             };
             write_header(&mut send, &response).await?;
             send.finish()?;
@@ -2381,6 +2395,47 @@ mod recovery_tests {
         let peer = find_peer(&phone, &id).unwrap();
         assert!(client.refresh_address(&peer).await.is_err());
         assert_eq!(stored(), before);
+        client.close().await;
+        Ok(())
+    }
+
+    /// One bad part sinks the whole answer: nothing of it is stored, or one reply could
+    /// move a peer's address, name and management flag while `hostRefresh` says it failed.
+    #[tokio::test]
+    async fn a_rejected_answer_changes_nothing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let phone = Store::open(&dir.path().join("phone"), "phone")?;
+        let bridge = Store::open(&dir.path().join("bridge"), "bridge")?;
+        let endpoint = endpoint(&bridge, &NetOptions::loopback(), true).await?;
+        let known = endpoint.addr();
+        let id = known.id.to_string();
+        phone.remember_peer(&known, "bridge", &["t3".into()], false)?;
+        let client = Client::new(phone.clone(), NetOptions::loopback()).await?;
+        let moved: TransportAddr = TransportAddr::Ip("203.0.113.7:4433".parse()?);
+        let invalid = crate::routes::ServiceRoute {
+            service: "t3".into(),
+            url: "http://bridge.example.net/".into(),
+        };
+        let before = serde_json::to_value(find_peer(&phone, &id).unwrap())?;
+
+        let server = answer_hello_with(
+            endpoint.clone(),
+            "renamed",
+            true,
+            vec![invalid],
+            |mut own| {
+                own.addrs.insert(moved);
+                own
+            },
+        );
+        let peer = find_peer(&phone, &id).unwrap();
+        assert!(client.refresh_address(&peer).await.is_err());
+        server.await??;
+
+        assert_eq!(
+            serde_json::to_value(find_peer(&phone, &id).unwrap())?,
+            before
+        );
         client.close().await;
         Ok(())
     }

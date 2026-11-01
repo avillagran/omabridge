@@ -1,8 +1,8 @@
 //! Public service routes announced by already paired gateway devices.
 //! Routes do not grant access. The owning device's current public consent is
 //! checked again when exporting them, and old announcements expire.
-use crate::{Store, gateway};
-use anyhow::{Context, Result, ensure};
+use crate::{Peer, Store, gateway};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 pub const ROUTE_TTL: u64 = 600;
@@ -60,47 +60,68 @@ pub(crate) fn own_for_peer(store: &Store, peer: &crate::Peer) -> Vec<ServiceRout
     routes
 }
 
+/// The same routes are announced over and over. Their age is written again only after this
+/// long, well inside `ROUTE_TTL` even for a device that announces every `SYNC_INTERVAL`, so a
+/// repeated `Hello` costs no durable write and live routes do not expire.
+const ROUTE_REFRESH: u64 = ROUTE_TTL / 4;
+
+pub(crate) fn check_host_routes(routes: &[ServiceRoute]) -> Result<()> {
+    ensure!(
+        routes.len() <= gateway::MAX_GATEWAYS
+            && routes
+                .iter()
+                .all(|route| route.service == "t3" && route.valid()),
+        "invalid host routes"
+    );
+    Ok(())
+}
+
+pub(crate) fn check_gateway_routes(routes: &[ServiceRoute]) -> Result<()> {
+    ensure!(
+        routes.len() <= gateway::MAX_GATEWAYS && routes.iter().all(ServiceRoute::valid),
+        "invalid gateway routes"
+    );
+    Ok(())
+}
+
+/// A host's announcement to its bridge. Only ever writes what the host reported; this
+/// device's own consent bit is out of reach here.
+pub(crate) fn apply_host_routes(peer: &mut Peer, consent: bool, routes: &[ServiceRoute]) {
+    peer.remote_bridge_consent = consent;
+    peer.remote_routes = if consent { routes.to_vec() } else { Vec::new() };
+}
+
+pub(crate) fn apply_gateway_routes(peer: &mut Peer, routes: &[ServiceRoute], now: u64) {
+    let routes: Vec<_> = routes
+        .iter()
+        .filter(|route| {
+            peer.services.contains(&route.service) && peer.public.contains(&route.service)
+        })
+        .cloned()
+        .collect();
+    let aged = peer.routes_updated > now || now - peer.routes_updated >= ROUTE_REFRESH;
+    if routes != peer.gateway_routes || (aged && !routes.is_empty()) {
+        peer.gateway_routes = routes;
+        peer.routes_updated = now;
+    }
+}
+
 impl Store {
-    /// A host's announcement to its bridge. Only ever writes what the host
-    /// reported; this device's own consent bit is out of reach here.
+    #[cfg(test)]
     pub(crate) fn refresh_host(
         &self,
         id: &str,
         consent: bool,
         routes: &[ServiceRoute],
     ) -> Result<()> {
-        ensure!(
-            routes.len() <= gateway::MAX_GATEWAYS
-                && routes
-                    .iter()
-                    .all(|route| route.service == "t3" && route.valid()),
-            "invalid host routes"
-        );
-        self.update(|state| {
-            let peer = state.peers.get_mut(id).context("unknown peer")?;
-            peer.remote_bridge_consent = consent;
-            peer.remote_routes = if consent { routes.to_vec() } else { Vec::new() };
-            Ok(())
-        })
+        check_host_routes(routes)?;
+        self.update_peer(id, |peer| apply_host_routes(peer, consent, routes))
     }
 
+    #[cfg(test)]
     pub(crate) fn refresh_routes(&self, id: &str, routes: &[ServiceRoute], now: u64) -> Result<()> {
-        ensure!(
-            routes.len() <= gateway::MAX_GATEWAYS && routes.iter().all(ServiceRoute::valid),
-            "invalid gateway routes"
-        );
-        self.update(|state| {
-            let peer = state.peers.get_mut(id).context("unknown peer")?;
-            peer.gateway_routes = routes
-                .iter()
-                .filter(|route| {
-                    peer.services.contains(&route.service) && peer.public.contains(&route.service)
-                })
-                .cloned()
-                .collect();
-            peer.routes_updated = now;
-            Ok(())
-        })
+        check_gateway_routes(routes)?;
+        self.update_peer(id, |peer| apply_gateway_routes(peer, routes, now))
     }
 
     /// Read-only discovery for local consumers. No network calls or secrets.
@@ -127,7 +148,140 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use crate::Announcement;
+    use anyhow::Context;
+    use iroh::{EndpointAddr, TransportAddr};
+    use std::{os::unix::fs::MetadataExt, time::Duration};
+
+    const PUBLIC_ROUTE: &str = "https://desktop.example.net:2345/";
+
+    fn route(url: &str) -> ServiceRoute {
+        ServiceRoute {
+            service: "t3".into(),
+            url: url.into(),
+        }
+    }
+
+    /// `owner` paired with a device that publishes t3 through it.
+    fn paired(dir: &std::path::Path) -> Result<(Store, String)> {
+        let owner = Store::open(&dir.join("owner"), "owner")?;
+        let gateway = Store::open(&dir.join("gateway"), "gateway")?;
+        let id = gateway.id()?;
+        let token = owner.create_invite(&["t3".into()], Duration::from_secs(60), 100)?;
+        owner.claim(&token, &id, "gateway", 100)?;
+        owner.approve(&id, 100)?;
+        owner.set_services(&id, &["t3".into()], &["t3".into()])?;
+        Ok((owner, id))
+    }
+
+    /// `state.json` is replaced by rename, so any durable write gives it a new inode.
+    fn written(store: &Store) -> Result<u64> {
+        Ok(std::fs::metadata(store.root().join("state.json"))?.ino())
+    }
+
+    fn snapshot(store: &Store, id: &str) -> Result<serde_json::Value> {
+        let peers = store.peers()?;
+        let peer = peers.iter().find(|peer| peer.id == id);
+        Ok(serde_json::to_value(peer.context("unknown peer")?)?)
+    }
+
+    #[test]
+    fn a_rejected_announcement_changes_nothing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (owner, id) = paired(dir.path())?;
+        let address = EndpointAddr {
+            id: id.parse()?,
+            addrs: [TransportAddr::Ip("203.0.113.7:4433".parse()?)].into(),
+        };
+        let good = [route(PUBLIC_ROUTE)];
+        let bad = [route("http://desktop.example.net/")];
+        let services = vec!["t3".to_string()];
+        let invalid = vec!["not a service!".to_string()];
+        let valid = Announcement {
+            name: "renamed",
+            address: Some(&address),
+            managed: true,
+            grants: Some((&services, &services)),
+            routes: Some(&good),
+            bridge_consent: true,
+            host_routes: &good,
+        };
+        let before = (snapshot(&owner, &id)?, written(&owner)?);
+        for rejected in [
+            Announcement { name: "", ..valid },
+            Announcement {
+                grants: Some((&invalid, &services)),
+                ..valid
+            },
+            Announcement {
+                routes: Some(&bad),
+                ..valid
+            },
+            Announcement {
+                host_routes: &bad,
+                ..valid
+            },
+        ] {
+            assert!(owner.refresh_announcement(&id, &rejected, 200).is_err());
+            assert_eq!((snapshot(&owner, &id)?, written(&owner)?), before);
+        }
+        owner.refresh_announcement(&id, &valid, 200)?;
+        let applied = snapshot(&owner, &id)?;
+        assert_eq!(applied["name"], "renamed");
+        assert_eq!(applied["managed"], true);
+        assert_eq!(owner.service_routes(200)?, good);
+        Ok(())
+    }
+
+    #[test]
+    fn a_repeated_announcement_writes_nothing_and_keeps_its_routes_alive() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (owner, id) = paired(dir.path())?;
+        let routes = [route(PUBLIC_ROUTE)];
+        let hello = Announcement {
+            name: "gateway",
+            address: None,
+            managed: false,
+            grants: None,
+            routes: Some(&routes),
+            bridge_consent: false,
+            host_routes: &[],
+        };
+        owner.refresh_announcement(&id, &hello, 1000)?;
+        let first = written(&owner)?;
+
+        // A burst, as a phone's network changes make: nothing new, nothing written.
+        for second in 1..ROUTE_REFRESH {
+            owner.refresh_announcement(&id, &hello, 1000 + second)?;
+        }
+        assert_eq!(written(&owner)?, first);
+
+        // A real change is written at once.
+        let moved = [route("https://other.example.net:2345/")];
+        let changed = Announcement {
+            routes: Some(&moved),
+            ..hello
+        };
+        owner.refresh_announcement(&id, &changed, 1000 + ROUTE_REFRESH - 1)?;
+        assert_ne!(written(&owner)?, first);
+
+        // A device announcing at its usual pace never lets its routes lapse.
+        let mut now = 2000;
+        owner.refresh_announcement(&id, &hello, now)?;
+        for _ in 0..4 {
+            now += crate::SYNC_INTERVAL.as_secs();
+            assert_eq!(owner.service_routes(now)?, routes, "live at {now}");
+            owner.refresh_announcement(&id, &hello, now)?;
+        }
+
+        // Silence still expires them, from the last time their age was written.
+        let settled = now;
+        for second in 1..ROUTE_REFRESH {
+            owner.refresh_announcement(&id, &hello, settled + second)?;
+        }
+        assert!(owner.service_routes(settled + ROUTE_TTL)?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn routes_require_current_consent_expire_and_cannot_cross_owners() -> Result<()> {

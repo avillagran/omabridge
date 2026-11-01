@@ -64,19 +64,47 @@ withdrawal/expiry/route change. Host-owned drafts/cursors/selections never enter
 ## Route fallback for independent rows (route-fallback-v1)
 
 `projection` also returns `routeFallbacks: [{id, baseUrl}]`: rows with no bridge
-provenance and a different URL, whose `environmentId` has a route in the catalog. It
-is computed from the cached catalog too, because an unreachable bridge is when a phone
-needs it most, and it stays empty for withdrawn or denied environments and for routes
-that are not HTTPS. The plan does not touch these rows: no `upserts`, no `stop`.
+provenance and a different URL, whose `environmentId` has a route in the catalog. Each
+entry is an **offer, not a permission**. It is computed from the cached catalog too,
+because an unreachable bridge is when a phone needs it most, but only until seven days
+after the catalog's `expiresAt` (`ROUTE_FALLBACK_STALE_MS`): past that a name may have
+changed hands, so nothing is offered. It stays empty for withdrawn or denied
+environments and for routes that are not HTTPS. The plan does not touch these rows:
+no `upserts`, no `stop`.
 
-The host stays on the row's own URL and uses the fallback only while that URL is out
-of reach. Before sending the row's credential it must verify the environment UUID from
-the descriptor over HTTPS; a mismatch or a rejected credential drops the fallback, not
-the row. It returns to the row's URL as soon as that answers again. **The bearer of an
-independent row can reach a URL named by the bridge.** The bridge never sees the bearer,
-but it chooses the name, so this trusts it to the same degree as the routes of its own
-rows. A public T3 descriptor is not proof of possession, so remove the bridge or use
-only rows it manages if that trust is not wanted.
+**A host must not send a row's credential to an offered route on its own.** The contract:
+
+1. Off by default. Nothing is sent to the offered URL, not even a descriptor request,
+   before the user approves.
+2. When the row's own URL is out of reach, show the offered hostname on that row and ask.
+3. Bind the approval to that row and that exact origin (scheme, host and port), and
+   store it locally. A different origin asks again.
+4. After approval, stay on the row's own URL and use the fallback only while that URL is
+   out of reach. Before sending the credential, verify the environment UUID from the
+   descriptor over HTTPS. Stop as soon as the offer disappears, and return to the row's
+   URL as soon as it answers.
+5. Show that the fallback is in use. A mismatch or a refused credential drops the
+   fallback, not the row, and the refusal is shown on the row, not hidden behind the
+   row's own error.
+
+If the host's call to `refresh` fails, as it does for a catalog that fails validation
+(for example a rolled-back revision), the host must drop the offers it holds and not
+restore them from cache until a catalog validates again.
+
+**What approval trusts.** The bearer of an independent row goes to a URL named by the
+bridge. Gateways terminate TLS on the device that runs them, which can be the bridge
+itself, so that device reads the bearer and every request in clear. A bearer read there
+is a full credential for that server, usable from anywhere and for as long as it lasts.
+HTTPS and a matching UUID prove only that the name serves that UUID: a T3 descriptor is
+public, so neither is proof of possession. Approving therefore trusts the operator of
+that gateway and the bridge that named it with the row's access, which can be write
+access the bridge was never granted on that host. Without the approval, this path stays
+closed. Use rows the bridge manages, or leave the offer unapproved, if that trust is not
+wanted.
+
+Future work: the fallback should carry a credential the bridge issued for that purpose
+(bounded, per client and per environment, as `hostPair` does), so that the row's own
+bearer never leaves for a route the bridge named. This is not implemented.
 
 ## Enrollment boundary
 

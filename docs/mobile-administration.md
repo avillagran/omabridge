@@ -90,6 +90,11 @@ result, not an error.
   is a hint: it can only say where to dial, the dial is authenticated again, and it
   never adds a grant or a peer. Addresses go through the same filter as any
   announcement.
+* **A rejected answer changes nothing.** Name, address, management flag, grants and
+  routes are all checked first and applied in one update, on both ends of a `Hello`, so
+  one bad part leaves all of them as they were. An answer that says nothing new is not
+  written to disk; the age of unchanged routes is written every 150 s at most, well
+  inside their ten-minute lifetime.
 * **It cannot lose the way back.** An answer with nothing usable changes nothing,
   and one without a relay keeps the known relay.
 * It updates the running catalog manager, so `refresh`, `enroll` and `hostPair`
@@ -101,7 +106,17 @@ result, not an error.
 A phone has to reach the bridge once to learn from it. Move a bridge while the phone
 can still dial it, usually on the LAN, and let it refresh before it leaves. Call this
 from a worker thread after a catalog failure or recovery, on a network change and
-every few minutes while connected, with jitter: SDK calls are serialized.
+every few minutes while connected, with jitter and a minimum interval between network
+changes, because phones change networks in bursts and SDK calls are serialized.
+
+Limits around relays. An accepted answer that names a relay replaces every stored
+address, direct ones included, and the phone keeps no earlier relay to go back to. If
+that relay is out of reach from the phone, and no other announced address works, the
+phone cannot learn the next move and has to pair again. A bridge that stops using a
+relay can only say so by naming another one: an answer without a relay keeps the old
+one, which stays stored, unused or failing, until a later answer names a relay. A relay
+chosen by the bridge cannot impersonate it, because every dial authenticates the paired
+key, but it learns when and from where the phone connects.
 
 ## Authenticated service HTTP (service-request-v1)
 

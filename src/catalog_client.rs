@@ -13,6 +13,9 @@ pub const NATIVE_AUTHORIZED: &str = "native_authorized";
 pub const NATIVE_EXPIRED: &str = "native_expired";
 /// Asking again this long before a native session ends leaves room to be offline.
 pub const NATIVE_RENEW_BEFORE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// How long past its expiry a catalog still offers routes to independent rows: an unreachable
+/// bridge is when a phone needs them, but a route must not outlive what vouched for it.
+pub const ROUTE_FALLBACK_STALE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug)]
 pub struct CatalogDenied;
@@ -188,9 +191,11 @@ impl CatalogManager {
     /// its session while the catalog is merely stale; only withdrawal stops it.
     /// `hostEnroll` lists new environments of an all-hosts bridge and `renew` the
     /// native rows due: both are served by `Client::t3_host_pair`, never `enroll`.
-    /// `routeFallbacks` lists independent rows with a route to use while their own URL
-    /// is out of reach. The row and its credential stay untouched: the host checks the
-    /// descriptor over HTTPS before it sends that credential there.
+    /// `routeFallbacks` lists independent rows with a route they may be offered while their
+    /// own URL is out of reach, until `ROUTE_FALLBACK_STALE_MS` past the catalog's expiry.
+    /// It is an offer: the host asks the user per row and per exact origin, then checks the
+    /// descriptor over HTTPS, before it sends the row's credential there. The row and its
+    /// credential stay untouched.
     pub fn projection(&self, local: &Value, now: u64) -> Result<Value> {
         let rows = local.as_array().context("invalid local environments")?;
         let mut upserts = Vec::new();
@@ -211,8 +216,9 @@ impl CatalogManager {
                 .context("invalid cached identity")?;
             let provenance = format!("bridge:{}:{}", self.bridge.id, self.store.id()?);
             // A stale catalog still names the route, so this works with the bridge out
-            // of reach; a withdrawal does not.
-            if !self.denied && entry["removed"] != true {
+            // of reach, for a bounded time; a withdrawal does not.
+            let offers_routes = now <= self.expires_at.saturating_add(ROUTE_FALLBACK_STALE_MS);
+            if offers_routes && !self.denied && entry["removed"] != true {
                 let route = best_route(entry);
                 for manual in rows.iter().filter(|r| {
                     r["environmentId"] == id && r["provenance"].is_null() && r["baseUrl"] != route
@@ -457,6 +463,14 @@ mod tests {
         let stale = manager(dir.path(), true, false, false);
         let plan = stale.projection(&json!([manual("lan", lan)]), NOW)?;
         assert_eq!(plan["routeFallbacks"], offered);
+
+        // Up to seven days past the catalog's expiry, and not one moment longer.
+        let limit = stale.expires_at + ROUTE_FALLBACK_STALE_MS;
+        let plan = stale.projection(&json!([manual("lan", lan)]), limit)?;
+        assert_eq!(plan["routeFallbacks"], offered);
+        let plan = stale.projection(&json!([manual("lan", lan)]), limit + 1)?;
+        assert_eq!(plan["routeFallbacks"], json!([]));
+        assert_eq!(ROUTE_FALLBACK_STALE_MS, 7 * DAY, "the documented limit");
 
         // Every matching manual row, also beside the bridge's own row.
         let provenance = format!("bridge:{}:{}", fresh.bridge.id, fresh.store.id()?);
