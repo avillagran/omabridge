@@ -6,7 +6,7 @@ explicit per-peer `admin` grant (`manage` in the UI). Pairing, `t3`, all-hosts o
 receiving device on every request. Do not infer it from cached announcements.
 
 C ABI stays v1: signatures and existing operations are unchanged. Query
-`{"op":"capabilities"}` (no handle) for `{abi:1,features:["mobile-admin-v1","shared-drafts-v1"]}`.
+`{"op":"capabilities"}` (no handle) for `{abi:1,features:["mobile-admin-v1","shared-drafts-v1","service-request-v1"]}`.
 Then use the normal `open`/`pair` flow. All following calls use that handle:
 
 * `{"op":"peers","handle":N}` returns the phone's identity and paired peers,
@@ -64,3 +64,73 @@ and show those reasons. Render inline invitation JSON with the existing invitati
 QR/share flow, and discard it after use. All-hosts approval must direct the user
 to the owner device. See [shared drafts](shared-drafts.md) for the separate grant
 and composer repository integration; no Android application code is changed here.
+
+## Authenticated service HTTP (service-request-v1)
+
+The unchanged C ABI v1 advertises `service-request-v1` in `capabilities.features`.
+This production operation is independent of `lab-tls`; `labRequest` remains a
+feature-gated laboratory helper. It opens one authenticated bridge tunnel to one
+explicit service on one paired peer. The receiving peer checks its current service
+grant on every open. An admin, `t3` or enrollment grant does not substitute for a
+`desktop-snapshots` grant. The host owner must configure that service separately.
+
+```json
+{"op":"serviceRequest","handle":1,"requestId":"snapshot-1","peer":"<device-id>","service":"desktop-snapshots","method":"GET","path":"/v1/session","bearer":"<phone-T3-token>","headers":{"accept":"application/json"},"timeoutMs":15000}
+```
+
+* `method`: exactly `GET` or `POST`. `path`: origin-form, at most 4096 bytes,
+  beginning with one `/`, with no fragment, scheme or authority.
+* `bearer`: required, nonempty ASCII graphic characters, at most 8192 bytes.
+  Passed directly as `Authorization: Bearer …`; never written to state, diagnostics
+  or logs. The caller must likewise exclude input JSON from logging/persistence.
+* Optional `bodyBase64`: standard base64 of at most 512 KiB decoded bytes. GET
+  requires an empty body. Optional `headers` is an object permitting only lowercase
+  `accept`, `content-type`, `x-t3-orchestration-protocol`; at most 32 entries and
+  16 KiB including authorization/framing allowance. Framing/routing/authentication
+  headers are SDK-owned. No cookies, proxies, URL credentials or redirects.
+* `timeoutMs`: required, 1–120000, covering tunnel setup, send and response read.
+  One HTTP/1.1 request per tunnel, no connection pool and no automatic retries,
+  including GET, POST, redirects and connection failures.
+* Response body is bounded to 512 KiB; response headers to 16 KiB and 64 entries.
+  Binary bodies use base64. `headersBase64` is an array of `[lowercase-name,
+  base64-value]` pairs preserving repeated headers; authorization, proxy
+  authorization and Set-Cookie are excluded.
+
+The usual outer `{ok:…}` envelope contains one of:
+
+```json
+{"outcome":"http","httpStatus":403,"headersBase64":[],"bodyBase64":"e30="}
+{"outcome":"notSent","reason":"transport"}
+{"outcome":"unknown","reason":"timeout"}
+```
+
+`http` means a complete, bounded HTTP response, including non-2xx or 3xx status;
+Android decides how to handle the status. `notSent` means no application HTTP send
+was started (including refused service grants). `unknown` conservatively means the
+request may have reached the application but a complete response was not obtained.
+The SDK crosses this boundary immediately before handing the request to HTTP,
+so even a send error can be unknown. Never automatically repeat a maintenance
+POST after unknown; refresh/reconcile application state or ask the user.
+Reasons are fixed `transport`, `timeout`, `cancelled`, `response_too_large` codes,
+never raw network/parser errors. Invalid inputs use outer `{error:…}` as before.
+
+Call from an Android worker thread. While it is active, another thread can call
+`{"op":"cancelServiceRequest","handle":1,"requestId":"snapshot-1"}`. It returns
+`{ok:{cancelled:true}}` if cancellation was signalled to an active request, false
+if absent/already completed; a completion racing cancellation may still win.
+The request's result reports `cancelled` with `notSent` or `unknown` according to
+its send boundary. Cancellation closes/drops the tunnel; it cannot roll back a
+POST. Request IDs must be nonempty and at most 128 bytes. They are local transient
+correlation IDs, never server idempotency keys. Existing calls remain serialized
+by the SDK registry; cancellation bypasses that lock. Cancel only after dispatch;
+queued requests are not registered yet. `close` waits for the active call; cancel
+first when shutting down. Keep bearer and result bodies out of crash reports.
+
+Android integration: pin/build this PR's SDK with the existing JNI C ABI wrapper,
+query capabilities, use the paired handle and selected peer from `peers`, then
+call `serviceRequest` with service `desktop-snapshots` and the phone's current T3
+bearer. Decode `bodyBase64` only for `http`, check `httpStatus`, then parse the
+broker JSON. Use POST bodies encoded as UTF-8 JSON/base64 with content-type
+`application/json`. Connect coroutine cancellation to `cancelServiceRequest`
+from another worker thread. Do not use `labRequest` or persist the bearer in
+OmaBridge state. This change does not configure services or change any grants.
