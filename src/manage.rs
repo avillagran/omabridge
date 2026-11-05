@@ -288,6 +288,44 @@ fn private_dir(path: &Path) -> Outcome<()> {
 }
 
 /// `service=127.0.0.1:port` pairs from an OmaBridge-written serve unit.
+/// The `ExecStart=` systemd runs for `path`: the unit's own line, then each
+/// `<unit>.d/*.conf` drop-in in name order, where an empty `ExecStart=` clears it.
+fn effective_exec_start(path: &Path) -> Option<String> {
+    let mut sources = vec![fs::read_to_string(path).ok()?];
+    let mut drop_ins: Vec<PathBuf> = fs::read_dir(path.with_extension("service.d"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "conf"))
+        .collect();
+    drop_ins.sort();
+    sources.extend(
+        drop_ins
+            .iter()
+            .filter_map(|path| fs::read_to_string(path).ok()),
+    );
+    let mut exec = None;
+    for line in sources.iter().flat_map(|text| text.lines()) {
+        if let Some(value) = line.strip_prefix("ExecStart=") {
+            exec = (!value.trim().is_empty()).then(|| value.to_owned());
+        }
+    }
+    exec
+}
+
+/// The `--t3-runtime` file the publishing unit follows, drop-ins included.
+fn served_t3_runtime(path: &Path) -> Option<PathBuf> {
+    let exec = effective_exec_start(path)?;
+    let words: Vec<&str> = exec.split_whitespace().collect();
+    words
+        .windows(2)
+        .rev()
+        .find(|pair| pair[0] == "--t3-runtime")
+        .map(|pair| PathBuf::from(pair[1]))
+        .filter(|path| path.is_absolute())
+}
+
 fn unit_services(path: &Path) -> Option<Vec<(String, SocketAddr)>> {
     let unit = fs::read_to_string(path).ok()?;
     if unit.lines().next() != Some(units::MARKER) {
@@ -614,8 +652,18 @@ impl Manager {
         })
     }
 
+    /// The T3-compatible server's runtime file. While the file a publication
+    /// follows exists, that one, so a server with its own profile (O3 Server, or T3
+    /// under another `T3CODE_HOME`) is seen as the serving daemon sees it and a
+    /// republish keeps following it; otherwise the default profile's.
+    fn t3_runtime(&self) -> PathBuf {
+        served_t3_runtime(&self.units.dir().join(SERVE_UNIT))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| self.t3_runtime.clone())
+    }
+
     fn t3_port(&self) -> Option<u16> {
-        let runtime: Value = serde_json::from_slice(&fs::read(&self.t3_runtime).ok()?).ok()?;
+        let runtime: Value = serde_json::from_slice(&fs::read(self.t3_runtime()).ok()?).ok()?;
         let port = u16::try_from(runtime["port"].as_u64()?)
             .ok()
             .filter(|port| *port > 0)?;
@@ -636,21 +684,11 @@ impl Manager {
             .and_then(|store| store.active_endpoint().ok())
             .map(|(_, services)| services);
         let t3 = self.t3_port();
-        let follows_t3 = fs::read_to_string(self.units.dir().join(SERVE_UNIT))
+        let unit_path = self.units.dir().join(SERVE_UNIT);
+        let follows_t3 = fs::read_to_string(&unit_path)
             .ok()
-            .filter(|text| text.lines().next() == Some(units::MARKER))
-            .is_some_and(|text| {
-                text.lines()
-                    .filter(|line| line.starts_with("ExecStart="))
-                    .any(|line| {
-                        line.split_whitespace()
-                            .collect::<Vec<_>>()
-                            .windows(2)
-                            .any(|pair| {
-                                pair[0] == "--t3-runtime" && Path::new(pair[1]) == self.t3_runtime
-                            })
-                    })
-            });
+            .is_some_and(|text| text.lines().next() == Some(units::MARKER))
+            && served_t3_runtime(&unit_path).is_some();
         let stale = !follows_t3
             && unit.as_ref().is_some_and(|services| {
                 services.iter().any(|(name, target)| {
@@ -1052,7 +1090,7 @@ impl Manager {
         let spec = if services.iter().any(|(name, _)| name == "t3") {
             UnitSpec::ServeTracked {
                 services: services.clone(),
-                t3_runtime: self.t3_runtime.clone(),
+                t3_runtime: self.t3_runtime(),
             }
         } else {
             UnitSpec::Serve {
