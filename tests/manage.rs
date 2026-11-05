@@ -455,6 +455,84 @@ async fn manage_publishes_through_the_single_omabridge_unit() -> anyhow::Result<
 }
 
 #[tokio::test]
+async fn manage_follows_the_runtime_its_unit_names_including_drop_ins() -> anyhow::Result<()> {
+    // O3 Server keeps its own profile, and a drop-in points the publication there.
+    let dir = tempfile::tempdir()?;
+    let runner = Arc::new(FakeRunner::default());
+    let host = manager(dir.path(), "host", runner);
+    let t3 = std::net::TcpListener::bind("127.0.0.1:0")?;
+    fs::create_dir_all(host.t3_runtime.parent().unwrap())?;
+    fs::write(
+        &host.t3_runtime,
+        json!({"port": t3.local_addr()?.port()}).to_string(),
+    )?;
+    ok(
+        &host,
+        json!({"action":"publish","t3":true,"confirmed":true}),
+    )
+    .await;
+    fs::remove_file(&host.t3_runtime)?;
+    drop(t3);
+    assert_eq!(
+        ok(&host, json!({"action":"read"})).await["published"]["t3Available"],
+        false
+    );
+
+    let o3 = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let o3_runtime = dir.path().join("o3-profile/userdata/server-runtime.json");
+    fs::create_dir_all(o3_runtime.parent().unwrap())?;
+    fs::write(
+        &o3_runtime,
+        json!({"port": o3.local_addr()?.port()}).to_string(),
+    )?;
+    let drop_ins = host.units.dir().join(format!("{SERVE_UNIT}.d"));
+    fs::create_dir_all(&drop_ins)?;
+    fs::write(
+        drop_ins.join("10-unrelated.conf"),
+        "[Service]\nMemoryMax=64M\n",
+    )?;
+    fs::write(
+        drop_ins.join("zz-o3.conf"),
+        format!(
+            "[Service]\nExecStart=\nExecStart=/bin/omabridge serve --service t3={} --t3-runtime {}\n",
+            o3.local_addr()?,
+            o3_runtime.display()
+        ),
+    )?;
+    let read = ok(&host, json!({"action":"read"})).await;
+    assert_eq!(read["published"]["t3Available"], true);
+    assert_eq!(read["published"]["followsT3"], true);
+    assert_eq!(read["published"]["stale"], false);
+
+    // Republishing keeps following the server the daemon follows.
+    ok(
+        &host,
+        json!({"action":"publish","t3":true,"confirmed":true}),
+    )
+    .await;
+    let unit = fs::read_to_string(host.units.dir().join(SERVE_UNIT))?;
+    assert!(unit.contains(&format!("--t3-runtime {}", o3_runtime.display())));
+    assert!(unit.contains(&format!("--service t3={}", o3.local_addr()?)));
+
+    // Once that server is gone, the default profile counts again.
+    fs::remove_file(&o3_runtime)?;
+    assert_eq!(
+        ok(&host, json!({"action":"read"})).await["published"]["t3Available"],
+        false
+    );
+    let t3 = std::net::TcpListener::bind("127.0.0.1:0")?;
+    fs::write(
+        &host.t3_runtime,
+        json!({"port": t3.local_addr()?.port()}).to_string(),
+    )?;
+    assert_eq!(
+        ok(&host, json!({"action":"read"})).await["published"]["t3Available"],
+        true
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn manage_saves_the_relay_and_restarts_its_own_unit() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let runner = Arc::new(FakeRunner::default());
