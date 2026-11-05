@@ -10,6 +10,7 @@ pub mod enrollment;
 pub mod gateway;
 pub mod gateway_domain;
 pub mod hosting;
+pub mod local_server;
 pub mod manage;
 pub mod mcp;
 pub(crate) mod network;

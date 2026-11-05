@@ -70,20 +70,41 @@ fn valid_environment(id: &str) -> bool {
 }
 
 impl T3Issuer {
-    /// This user's own T3 Code (`~/.t3`), when its CLI is installed.
+    /// This user's own local server: the one O3 Code registered (O3 Server or T3,
+    /// with its CLI), else T3 Code in `T3CODE_HOME` or `~/.t3` when its CLI is installed.
     pub fn detect() -> Option<Self> {
+        let server = crate::local_server::detect()?;
         let home = PathBuf::from(std::env::var_os("HOME")?);
-        Self::detect_in(&home, std::env::var_os("PATH"))
+        Self::for_server(&home, server, std::env::var_os("PATH"))
     }
 
-    /// The CLI of the T3 service that runs here comes first: `~/.t3/bin/t3`
-    /// may be the desktop app's launcher restored from another system, whose
-    /// app is gone, and every pairing would fail.
+    /// The registered CLI when it is installed, else T3's CLI search for that profile.
+    fn for_server(
+        home: &std::path::Path,
+        server: crate::local_server::LocalServer,
+        path: Option<std::ffi::OsString>,
+    ) -> Option<Self> {
+        if let Some(cli) = server.cli.as_ref().filter(|cli| is_executable(cli)) {
+            return Some(Self {
+                cli: cli.clone(),
+                base_dir: server.base_dir,
+            });
+        }
+        Self::detect_at(home, server.base_dir, path)
+    }
+
     fn detect_in(home: &std::path::Path, path: Option<std::ffi::OsString>) -> Option<Self> {
-        if !home.is_absolute() {
+        Self::detect_at(home, home.join(".t3"), path)
+    }
+
+    fn detect_at(
+        home: &std::path::Path,
+        base_dir: PathBuf,
+        path: Option<std::ffi::OsString>,
+    ) -> Option<Self> {
+        if !home.is_absolute() || !base_dir.is_absolute() {
             return None;
         }
-        let base_dir = home.join(".t3");
         let cli = runtime_cli(&base_dir)
             .into_iter()
             .chain([base_dir.join("bin/t3"), home.join(".local/bin/t3")])
@@ -296,6 +317,30 @@ mod tests {
         assert_eq!(
             T3Issuer::detect_in(home.path(), None).unwrap().cli,
             t3.join("runtime/versions/0.1.4-nightly.1/t3")
+        );
+    }
+
+    #[test]
+    fn issues_with_the_cli_o3_code_registered() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = home.path().join(".local/share/o3-server/profile");
+        let cli = home.path().join(".local/share/o3-server/bin/o3-server");
+        let server = crate::local_server::LocalServer {
+            base_dir: profile.clone(),
+            cli: Some(cli.clone()),
+        };
+        assert_eq!(
+            T3Issuer::for_server(home.path(), server.clone(), None),
+            None,
+            "a registered CLI that is not installed issues nothing"
+        );
+        executable(&cli, "#!/bin/sh\n");
+        assert_eq!(
+            T3Issuer::for_server(home.path(), server, None),
+            Some(T3Issuer {
+                cli,
+                base_dir: profile
+            })
         );
     }
 

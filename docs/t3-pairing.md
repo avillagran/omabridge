@@ -21,8 +21,12 @@ no arguments. The serving device:
    checks the receipt's label.
 4. Checks the grant again, then answers `{environmentId, credential, label}`.
 
-The issuer is this user's own T3 Code: `~/.t3`, with the CLI in `~/.t3/bin/t3`,
-`~/.local/bin/t3` or the `PATH`. Under `omabridge t3` it is that owned home and
+The issuer is this user's own local server. When O3 Code's registry
+(`~/.config/omarchy-t3-code/backends.json`) selects one, that is its profile and
+registered CLI, such as O3 Server's `o3-server`; `T3CODE_HOME` overrides the profile.
+Otherwise it is T3 Code in `~/.t3`, with the CLI in `~/.t3/bin/t3`,
+`~/.local/bin/t3` or the `PATH`. `omabridge manage` reads the same profile's
+`server-runtime.json` to publish `t3`. Under `omabridge t3` it is that owned home and
 binary. A server without a published `t3` service, or without a T3 CLI, denies
 every request.
 

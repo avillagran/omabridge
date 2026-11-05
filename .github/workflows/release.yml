@@ -1,0 +1,77 @@
+name: Release
+# Pushing a tag vX.Y.Z (equal to Cargo.toml's version) builds the Linux binaries
+# and publishes them with SHA256SUMS, the layout O3 Code's installer pins by hash.
+on:
+  push:
+    tags: ['v[0-9]*']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TARGET_DIR: /var/tmp/omabridge-build/release
+      TAG: ${{ github.ref_name }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the package version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "omabridge") | .version')
+          [[ "$TAG" == "v$version" ]] || { echo "tag $TAG does not match version $version" >&2; exit 1; }
+      - name: GUI build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+      - run: cargo build --release --locked -j 4 --bin omabridge
+      - run: cargo build --release --locked -j 4 --features gui --bin omabridge-gui
+      - name: Check the binaries
+        run: |
+          dir=$CARGO_TARGET_DIR/release
+          [[ $(uname -m) == "$ARCH" ]]
+          [[ $("$dir/omabridge" --version) == "omabridge ${TAG#v}" ]]
+          # Omarchy devices need glibc 2.39 or newer; never require more.
+          for bin in omabridge omabridge-gui; do
+            newest=$(objdump -T "$dir/$bin" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+            printf '%s requires %s\n' "$bin" "$newest"
+            [[ $(printf '%s\n' "$newest" GLIBC_2.39 | sort -V | tail -1) == GLIBC_2.39 ]]
+          done
+      - name: Package
+        run: |
+          name="omabridge-$TAG-$ARCH-linux"
+          mkdir -p "dist/$name"
+          install -m755 "$CARGO_TARGET_DIR/release/omabridge" "$CARGO_TARGET_DIR/release/omabridge-gui" "dist/$name/"
+          tar -C dist --owner=0 --group=0 --numeric-owner -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omabridge-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        run: |
+          cd dist
+          sha256sum omabridge-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "OmaBridge ${TAG#v}" \
+            --notes "OmaBridge ${TAG#v} is still **experimental**. Linux binaries (x86_64, aarch64; glibc 2.39 or newer). Verify the archives with \`sha256sum -c SHA256SUMS\`." \
+            omabridge-*.tar.gz SHA256SUMS
