@@ -324,10 +324,10 @@ impl Manager {
             compress_t3: false,
         };
         let home = home()?;
-        let t3_home = std::env::var_os("T3CODE_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| home.join(".t3"));
+        // T3CODE_HOME, else the server O3 Code registered (O3 Server keeps its own
+        // profile), else ~/.t3.
+        let t3_home =
+            crate::local_server::resolve(&crate::local_server::Env::from_process(&home)).base_dir;
         Ok(Self {
             state_dir,
             options,

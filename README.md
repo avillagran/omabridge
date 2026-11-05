@@ -31,7 +31,7 @@ One Rust library backs two executables:
 
 ## Install
 
-When available, prebuilt Linux binaries (x86_64 and aarch64) are attached to [GitHub releases](https://github.com/avillagran/omabridge/releases). Verify them with the published `SHA256SUMS`, then place `omabridge` somewhere on your `PATH`.
+Prebuilt Linux binaries (x86_64 and aarch64, glibc 2.39 or newer) are attached to [GitHub releases](https://github.com/avillagran/omabridge/releases), built by `.github/workflows/release.yml` when a `vX.Y.Z` tag equal to `Cargo.toml`'s version is pushed. Verify them with the published `SHA256SUMS`, then place `omabridge` somewhere on your `PATH`.
 
 To build from source you need Rust 1.91+ on Linux. Dependencies are pinned in `Cargo.lock`.
 
@@ -122,8 +122,9 @@ omabridge t3-pair --peer host    # {"environmentId":…,"credential":…,"label"
 
 The serving device answers only a device whose authenticated endpoint id holds
 its current `t3` grant. It checks that the T3 behind its published `t3` service is
-this user's own T3 Code (`~/.t3`, or the owned home of `omabridge t3`), then issues
-the pairing with that T3's CLI (`t3 auth pairing create --ttl 2m --label
+this user's own T3-compatible server (the one O3 Code's `backends.json` registers,
+such as O3 Server, else `~/.t3`, or the owned home of `omabridge t3`), then issues
+the pairing with that server's CLI (`t3 auth pairing create --ttl 2m --label
 omabridge:<peer>`). The asking device exchanges it through its `t3` forward for
 T3's own session, as T3 Connect does for an account's environments. Granting `t3`
 is the consent: from then on that device can act in your T3 Code with T3's
