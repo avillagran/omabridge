@@ -79,6 +79,11 @@ struct Entry {
 /// default. A registered server whose runtime file exists is preferred over a chosen
 /// one that has none, as O3 Code reflects a running server rather than its rival.
 /// A missing or malformed registry selects nothing.
+///
+/// Both servers may share one profile (O3 Code's native T3 fallback runs on O3
+/// Server's profile). The runtime file then exists for either, so the server that
+/// wrote it decides whose CLI issues pairings: a pairing created by the other one's
+/// CLI lands in a store the running server never reads.
 fn registered(env: &Env) -> Option<LocalServer> {
     let config = env
         .config_home
@@ -101,7 +106,7 @@ fn registered(env: &Env) -> Option<LocalServer> {
             || !profile.is_absolute()
             || !cli.is_absolute()
             || profile == Path::new("/")
-            || entries.iter().any(|e| e.id == id || e.profile == profile)
+            || entries.iter().any(|e| e.id == id)
         {
             return None;
         }
@@ -123,15 +128,40 @@ fn registered(env: &Env) -> Option<LocalServer> {
         .unwrap_or_else(|| default.to_owned());
     let has_runtime = |e: &Entry| e.profile.join("userdata/server-runtime.json").is_file();
     let chosen = entries.iter().find(|e| e.id == chosen_id)?;
-    let entry = if has_runtime(chosen) {
+    let mut entry = if has_runtime(chosen) {
         chosen
     } else {
         entries.iter().find(|e| has_runtime(e)).unwrap_or(chosen)
     };
+    if let Some(running) = running_on_shared_profile(&entries, entry) {
+        entry = running;
+    }
     Some(LocalServer {
         base_dir: entry.profile.clone(),
         cli: Some(entry.cli.clone()),
     })
+}
+
+/// When `entry` shares its profile with the other server, the one whose runtime file
+/// is there: O3 Server marks its `serverVersion` with `o3-`, T3 does not. `None`
+/// keeps `entry` (no shared profile, or no readable runtime).
+fn running_on_shared_profile<'a>(entries: &'a [Entry], entry: &'a Entry) -> Option<&'a Entry> {
+    if !entries
+        .iter()
+        .any(|e| e.id != entry.id && e.profile == entry.profile)
+    {
+        return None;
+    }
+    let runtime = read_json(&entry.profile.join("userdata/server-runtime.json"))?;
+    let version = runtime["serverVersion"].as_str()?;
+    let id = if version.starts_with("o3-") {
+        "o3"
+    } else {
+        "t3"
+    };
+    entries
+        .iter()
+        .find(|e| e.id == id && e.profile == entry.profile)
 }
 
 fn read_json(path: &Path) -> Option<serde_json::Value> {
@@ -250,6 +280,48 @@ mod tests {
         );
         write(&t3.join("userdata/server-runtime.json"), r#"{"port":3774}"#);
         assert_eq!(resolve(&env(home.path())).base_dir, t3);
+    }
+
+    #[test]
+    fn a_shared_profile_follows_the_server_that_runs_on_it() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = home.path().join(".t3");
+        registry(
+            home.path(),
+            serde_json::json!({"version":1,"default":"o3","servers":[
+                {"id":"o3","unit":"t3code.service","profile":profile,"cli":"/opt/o3-server"},
+                {"id":"t3","unit":"o3-t3-server.service","profile":profile,"cli":"/opt/t3"}]}),
+        );
+        assert_eq!(
+            resolve(&env(home.path())),
+            LocalServer {
+                base_dir: profile.clone(),
+                cli: Some("/opt/o3-server".into())
+            },
+            "nothing running yet: the default"
+        );
+        let runtime = profile.join("userdata/server-runtime.json");
+        write(&runtime, r#"{"port":3773,"serverVersion":"o3-0.1.0"}"#);
+        assert_eq!(
+            resolve(&env(home.path())).cli,
+            Some("/opt/o3-server".into())
+        );
+        write(
+            &home
+                .path()
+                .join(".local/state/omarchy-t3-code/backend-choice.json"),
+            r#"{"server":"t3"}"#,
+        );
+        assert_eq!(
+            resolve(&env(home.path())).cli,
+            Some("/opt/o3-server".into()),
+            "O3 Server still serves the profile, whatever was chosen"
+        );
+        write(
+            &runtime,
+            r#"{"port":3773,"serverVersion":"0.1.6-nightly.20261030.3904"}"#,
+        );
+        assert_eq!(resolve(&env(home.path())).cli, Some("/opt/t3".into()));
     }
 
     #[test]
