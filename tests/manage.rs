@@ -52,6 +52,8 @@ fn manager(root: &Path, name: &str, runner: Arc<FakeRunner>) -> Manager {
         // Nothing listens on port 9 of loopback in the test environment.
         ssh_target: "127.0.0.1:9".parse().unwrap(),
         mcp_target: "127.0.0.1:9".parse().unwrap(),
+        mcp_state: std::env::temp_dir().join("omabridge-test-no-mcp"),
+        mcp_env: std::env::temp_dir().join("omabridge-test-no-mcp.env"),
         t3_runtime: root.join(format!("{name}-t3/server-runtime.json")),
         publish_wait: Duration::ZERO,
         pair_timeout: Duration::from_secs(20),
@@ -1000,5 +1002,101 @@ async fn broken_domain_policy_cannot_prevent_closing_a_gateway() -> anyhow::Resu
     close["enabled"] = false.into();
     assert!(manager.execute(&close).await.is_ok());
     assert!(omabridge::gateway::load(store.root()).is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn manage_gives_the_mcp_connection_and_single_use_codes_only_locally() -> anyhow::Result<()> {
+    use omabridge::mcp::store::{GatewayStore, UpstreamCredential};
+    let dir = tempfile::tempdir()?;
+    let mut host = manager(dir.path(), "host", Arc::default());
+    host.mcp_state = dir.path().join("mcp-state");
+    host.mcp_env = dir.path().join("mcp.env");
+
+    // Not set up: says so and creates nothing.
+    let read = ok(&host, json!({"action":"mcp-read"})).await;
+    assert_eq!(read["mcp"]["configured"], false);
+    assert!(read["mcp"]["url"].is_null());
+    assert!(!host.mcp_state.exists());
+    assert_eq!(
+        host.execute(&json!({"action":"mcp-grant","confirmed":true}))
+            .await,
+        Err("omabridge_mcp_not_configured")
+    );
+
+    // A gateway linked to this device's server, published at a public origin.
+    let store = GatewayStore::open(&host.mcp_state)?;
+    store.set_upstream(&UpstreamCredential {
+        url: "http://127.0.0.1:3773".into(),
+        token: "secret".into(),
+        access: "approval-required".into(),
+        expires: omabridge::mcp::store::now() + 86400,
+    })?;
+    fs::write(
+        &host.mcp_env,
+        "OMABRIDGE_MCP_PUBLIC=https://mcp.example.test:52372/\n",
+    )?;
+    let read = ok(&host, json!({"action":"mcp-read"})).await;
+    assert_eq!(read["mcp"]["configured"], true);
+    assert_eq!(read["mcp"]["url"], "https://mcp.example.test:52372/mcp");
+    assert_eq!(read["mcp"]["linked"]["server"], "http://127.0.0.1:3773");
+    assert!(
+        !read.to_string().contains("secret"),
+        "the server credential never leaves the store"
+    );
+
+    // A code needs confirmation, reads by default, and is redeemable once.
+    assert_eq!(
+        host.execute(&json!({"action":"mcp-grant"})).await,
+        Err("confirmation_required")
+    );
+    let granted = ok(
+        &host,
+        json!({"action":"mcp-grant","confirmed":true,"label":"Dot"}),
+    )
+    .await;
+    let code = granted["mcpCode"]["code"].as_str().unwrap().to_owned();
+    assert_eq!(granted["mcpCode"]["access"], "read");
+    assert!(granted["mcpCode"]["expires"].as_u64().unwrap() <= omabridge::mcp::store::now() + 600);
+    assert_eq!(
+        host.execute(&json!({"action":"mcp-grant","confirmed":true,"access":"admin"}))
+            .await,
+        Err("invalid_command")
+    );
+    assert_eq!(
+        host.execute(&json!({"action":"mcp-revoke","confirmed":true,"grant":"grant_unknown"}))
+            .await,
+        Err("omabridge_peer_not_found")
+    );
+    // The authorization page redeems the code once; the connection then shows and can be revoked.
+    let grant = store.redeem_link_code(&code, "ChatGPT", "chatgpt.com")?;
+    assert!(
+        store
+            .redeem_link_code(&code, "ChatGPT", "chatgpt.com")
+            .is_err()
+    );
+    let read = ok(&host, json!({"action":"mcp-read"})).await;
+    assert_eq!(read["mcp"]["grants"][0]["id"], grant.id.as_str());
+    assert_eq!(read["mcp"]["grants"][0]["label"], "Dot");
+    assert_eq!(read["mcp"]["grants"][0]["allProjects"], true);
+    ok(
+        &host,
+        json!({"action":"mcp-revoke","confirmed":true,"grant":grant.id}),
+    )
+    .await;
+    let read = ok(&host, json!({"action":"mcp-read"})).await;
+    assert_eq!(read["mcp"]["grants"].as_array().unwrap().len(), 0);
+
+    // A managing device can neither read the connection nor mint codes.
+    host.remote = true;
+    assert_eq!(
+        host.execute(&json!({"action":"mcp-read"})).await.err(),
+        Some("invalid_action")
+    );
+    assert_eq!(
+        host.execute(&json!({"action":"mcp-grant","confirmed":true}))
+            .await,
+        Err("omabridge_remote_forbidden")
+    );
     Ok(())
 }

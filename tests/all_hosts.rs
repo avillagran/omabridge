@@ -535,6 +535,8 @@ fn manager(root: &Path) -> Manager {
         invite_dir: root.to_path_buf(),
         ssh_target: "127.0.0.1:22".parse().unwrap(),
         mcp_target: "127.0.0.1:8787".parse().unwrap(),
+        mcp_state: std::env::temp_dir().join("omabridge-test-no-mcp"),
+        mcp_env: std::env::temp_dir().join("omabridge-test-no-mcp.env"),
         t3_runtime: root.join("runtime.json"),
         publish_wait: Duration::ZERO,
         pair_timeout: Duration::from_secs(1),

@@ -39,6 +39,7 @@ pub const FEATURES: &[&str] = &[
     "delegated-enrollment-v1",
     "t3-pair-v1",
     "mcp-service",
+    "mcp-connect-v1",
     "service-routes",
     "gateway-domain",
     "all-hosts-invite-v1",
@@ -46,7 +47,7 @@ pub const FEATURES: &[&str] = &[
     "shared-drafts-v1",
 ];
 
-const ACTIONS: [&str; 19] = [
+const ACTIONS: [&str; 21] = [
     "identity-create",
     "invite",
     "invite-discard",
@@ -66,6 +67,8 @@ const ACTIONS: [&str; 19] = [
     "grant-set",
     "gateway-domain-set",
     "bridge-consent-set",
+    "mcp-grant",
+    "mcp-revoke",
 ];
 
 /// What a managing device may ask: never identities or pairing
@@ -97,6 +100,7 @@ const REMOTE_CODES: &[&str] = &[
     "omabridge_relay_invalid",
     "omabridge_ssh_unavailable",
     "omabridge_mcp_unavailable",
+    "omabridge_mcp_not_configured",
     "omabridge_t3_unavailable",
     "omabridge_nothing_to_publish",
     "omabridge_already_running",
@@ -136,6 +140,10 @@ pub struct Manager {
     pub ssh_target: SocketAddr,
     /// Where `omabridge mcp serve` listens when it is published as `mcp`.
     pub mcp_target: SocketAddr,
+    /// State of `omabridge mcp serve` (its grants and link codes), apart from the bridge's.
+    pub mcp_state: PathBuf,
+    /// Environment file naming the gateway's public HTTPS origin (`OMABRIDGE_MCP_PUBLIC`).
+    pub mcp_env: PathBuf,
     /// T3 Code's `server-runtime.json`, which names its loopback port.
     pub t3_runtime: PathBuf,
     /// How long `publish` waits for the published service to come up.
@@ -378,11 +386,121 @@ impl Manager {
                 .unwrap_or(home),
             ssh_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 22)),
             mcp_target: SocketAddr::from((Ipv4Addr::LOCALHOST, 8787)),
+            mcp_state: std::env::var_os("OMABRIDGE_MCP_STATE_DIR")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map_or_else(
+                    || xdg("XDG_DATA_HOME", ".local/share").map(|d| d.join("omabridge-mcp")),
+                    Ok,
+                )?,
+            mcp_env: xdg("XDG_CONFIG_HOME", ".config")?.join("omabridge/mcp.env"),
             t3_runtime: t3_home.join("userdata/server-runtime.json"),
             publish_wait: Duration::from_secs(5),
             pair_timeout: Duration::from_secs(30),
             remote: false,
         })
+    }
+
+    /// The gateway's public HTTPS origin, from its environment file; `None` serves loopback only.
+    fn mcp_public(&self) -> Option<String> {
+        let text = fs::read_to_string(&self.mcp_env).ok()?;
+        let value = text
+            .lines()
+            .rev()
+            .find_map(|line| line.trim().strip_prefix("OMABRIDGE_MCP_PUBLIC="))?
+            .trim()
+            .trim_matches('"')
+            .trim_end_matches('/')
+            .to_owned();
+        (value.starts_with("https://") && !value.chars().any(char::is_whitespace)).then_some(value)
+    }
+
+    /// The gateway's store, only once `omabridge mcp` has set it up: reading never creates it.
+    fn mcp_store(&self) -> Outcome<crate::mcp::store::GatewayStore> {
+        if !self.mcp_state.join("mcp").is_dir() {
+            return Err("omabridge_mcp_not_configured");
+        }
+        crate::mcp::store::GatewayStore::open(&self.mcp_state)
+            .map_err(|_| "omabridge_command_failed")
+    }
+
+    /// How a remote MCP client connects: the URL to give it, whether the gateway is serving
+    /// and linked to this device's server, and the connections approved so far (no secrets).
+    fn mcp_connect(&self) -> Outcome<Value> {
+        let url = self.mcp_public().map(|origin| format!("{origin}/mcp"));
+        let serving = listening(self.mcp_target);
+        let Ok(store) = self.mcp_store() else {
+            return Ok(
+                json!({"configured": false, "serving": serving, "url": url, "linked": null, "grants": []}),
+            );
+        };
+        let now = crate::mcp::store::now();
+        let linked = store
+            .upstream_routed()
+            .map_err(|_| "omabridge_command_failed")?
+            .0
+            .map(|u| json!({"server": u.url, "expires": u.expires}));
+        let mut grants: Vec<Value> = store
+            .grants()
+            .map_err(|_| "omabridge_command_failed")?
+            .into_iter()
+            .filter(|g| g.revoked.is_none() && g.expires > now)
+            .map(|g| {
+                json!({
+                    "id": g.id,
+                    "label": g.scope.label,
+                    "client": g.client_name,
+                    "access": g.scope.access,
+                    "allProjects": g.scope.all_projects,
+                    "projects": g.scope.projects.len(),
+                    "sessions": g.scope.sessions.as_ref().map(Vec::len),
+                    "created": g.created,
+                    "expires": g.expires,
+                })
+            })
+            .collect();
+        grants.sort_by_key(|g| std::cmp::Reverse(g["created"].as_u64()));
+        Ok(
+            json!({"configured": linked.is_some(), "serving": serving, "url": url, "linked": linked, "grants": grants}),
+        )
+    }
+
+    /// A single-use link code, valid ten minutes, that approves one MCP client for every
+    /// project of this device's server with the chosen access. Reading is the default.
+    fn mcp_grant(&self, request: &Value) -> Outcome<Value> {
+        let store = self.mcp_store()?;
+        if store
+            .upstream()
+            .map_err(|_| "omabridge_command_failed")?
+            .is_none()
+        {
+            return Err("omabridge_mcp_not_configured");
+        }
+        let access = match text(request, "access") {
+            "" | "read" => crate::mcp::store::Access::Read,
+            "operate" => crate::mcp::store::Access::Operate,
+            _ => return Err("invalid_command"),
+        };
+        let label = match text(request, "label").trim() {
+            "" => "dot".to_owned(),
+            label if label.len() <= 64 && !label.chars().any(char::is_control) => label.to_owned(),
+            _ => return Err("invalid_command"),
+        };
+        let scope = crate::mcp::store::GrantScope {
+            managed_catalog: None,
+            environments: Vec::new(),
+            label,
+            projects: Vec::new(),
+            all_projects: true,
+            sessions: None,
+            access,
+            ttl: 30 * 86400,
+        };
+        let (code, expires) = store
+            .create_link_code(scope.clone(), 600)
+            .map_err(|_| "omabridge_command_failed")?;
+        let _ = store.audit(json!({"event":"link_code_created","all_projects":true,"access":scope.access,"via":"manage"}));
+        Ok(json!({"code": code, "expires": expires, "access": scope.access}))
     }
 
     /// Mutating actions require `"confirmed": true`; discovery is read-only.
@@ -462,8 +580,18 @@ impl Manager {
             snapshot["synced"] = synced;
             return Ok(snapshot);
         }
+        // What a remote MCP client (ChatGPT, a dot) needs to connect; reading creates nothing.
+        if action == "mcp-read" && !self.remote {
+            let mut snapshot = self.snapshot();
+            snapshot["mcp"] = self.mcp_connect()?;
+            return Ok(snapshot);
+        }
         if !ACTIONS.contains(&action) {
             return Err("invalid_action");
+        }
+        // Who may connect to this device's server is decided on this device only.
+        if self.remote && action.starts_with("mcp-") {
+            return Err("omabridge_remote_forbidden");
         }
         if request["confirmed"] != true {
             return Err("confirmation_required");
@@ -505,6 +633,20 @@ impl Manager {
             "remote" => json!({ "remote": self.remote(request).await? }),
             "approve" => {
                 self.approve(request)?;
+                json!({})
+            }
+            "mcp-grant" => json!({ "mcpCode": self.mcp_grant(request)? }),
+            "mcp-revoke" => {
+                let grant = text(request, "grant");
+                let store = self.mcp_store()?;
+                if grant.is_empty()
+                    || !store
+                        .revoke(grant)
+                        .map_err(|_| "omabridge_command_failed")?
+                {
+                    return Err("omabridge_peer_not_found");
+                }
+                let _ = store.audit(json!({"event":"grant_revoked","grant":grant,"via":"manage"}));
                 json!({})
             }
             "revoke" => {
