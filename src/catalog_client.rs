@@ -252,6 +252,12 @@ impl CatalogManager {
                 .and_then(|r| r["id"].as_str())
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("{}:{}", provenance, id));
+            // An explicit identity migration can retain a formerly generated local ID.
+            // A cached entry for its old server must not reuse that ID for a different
+            // environment, stop the replacement session, or overwrite its credential.
+            if row.is_none() && rows.iter().any(|r| r["id"] == local_id) {
+                continue;
+            }
             let removed = self.denied || entry["removed"] == true;
             let native_expiry = existing
                 .filter(|r| r["status"] == NATIVE_AUTHORIZED || r["status"] == NATIVE_EXPIRED)
@@ -368,6 +374,42 @@ mod tests {
             "read-only enrollment would overwrite it"
         );
         assert_eq!(plan["hostEnroll"], json!([]));
+    }
+
+    #[test]
+    fn a_withdrawn_identity_cannot_overwrite_a_migrated_local_row() -> Result<()> {
+        // Keep the sandbox-only fixture: no recursive cleanup is part of this test.
+        let dir = tempfile::tempdir()?.keep();
+        let mut fresh = manager(&dir, true, true, true);
+        let current = "00000000-0000-4000-8000-000000000003";
+        let mut rows = native(&fresh, NATIVE_AUTHORIZED, NOW + 29 * DAY);
+        let retained_id = format!("bridge:{}:{}:{}", fresh.bridge.id, fresh.store.id()?, ENV);
+        rows[0]["id"] = json!(retained_id);
+        rows[0]["environmentId"] = json!(current);
+        let mut replacement = fresh.cache["environments"][0].clone();
+        replacement["environmentId"] = json!(current);
+        replacement["removed"] = json!(false);
+        fresh.cache["environments"].as_array_mut().unwrap().push(replacement);
+
+        let plan = fresh.projection(&rows, NOW)?;
+        assert_eq!(plan["upserts"].as_array().unwrap().len(), 1);
+        assert_eq!(plan["upserts"][0]["id"], retained_id);
+        assert_eq!(plan["upserts"][0]["environmentId"], current);
+        untouched(&plan);
+
+        // A later reappearance of the old server cannot take the retained ID either.
+        fresh.cache["environments"][0]["removed"] = json!(false);
+        let plan = fresh.projection(&rows, NOW)?;
+        assert_eq!(plan["upserts"].as_array().unwrap().len(), 1);
+        untouched(&plan);
+
+        // Revocation of the bridge still closes the replacement's own session.
+        fresh.denied = true;
+        let plan = fresh.projection(&rows, NOW)?;
+        assert_eq!(plan["upserts"].as_array().unwrap().len(), 1);
+        assert_eq!(plan["upserts"][0]["status"], "revoked");
+        assert_eq!(plan["stop"], json!([retained_id]));
+        Ok(())
     }
 
     #[test]
