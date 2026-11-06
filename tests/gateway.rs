@@ -170,6 +170,8 @@ async fn a_gateway_reaches_only_its_target_under_its_name() -> anyhow::Result<()
             invite_dir: dir.path().join("invites"),
             ssh_target: "127.0.0.1:9".parse()?,
             mcp_target: "127.0.0.1:9".parse()?,
+            mcp_state: std::env::temp_dir().join("omabridge-test-no-mcp"),
+            mcp_env: std::env::temp_dir().join("omabridge-test-no-mcp.env"),
             t3_runtime: dir.path().join("runtime.json"),
             publish_wait: Duration::ZERO,
             pair_timeout: Duration::from_secs(2),
