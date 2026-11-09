@@ -495,6 +495,7 @@ impl Manager {
             sessions: None,
             access,
             ttl: 30 * 86400,
+            bot_id: None,
         };
         let (code, expires) = store
             .create_link_code(scope.clone(), 600)

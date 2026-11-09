@@ -76,6 +76,10 @@ pub struct GrantScope {
     pub sessions: Option<Vec<String>>,
     pub access: Access,
     pub ttl: u64,
+    /// The T3 bot mailbox this connection reads and answers. It is set by the administrator and
+    /// never taken from tool arguments; without it the `t3_inbox_*` tools are not offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -773,6 +777,21 @@ impl GatewayStore {
 
     pub fn grants(&self) -> Result<Vec<Grant>> {
         self.view(|state| state.grants.values().cloned().collect())
+    }
+
+    /// Binds an existing grant to a bot mailbox (or clears it) without a new OAuth consent.
+    pub fn set_grant_bot(&self, grant: &str, bot_id: Option<&str>) -> Result<bool> {
+        ensure!(
+            bot_id.is_none_or(super::tools::valid_bot_id),
+            "invalid bot id: 1-64 of a-z, 0-9, '.', '_' or '-', starting with a letter or digit"
+        );
+        self.update(|state| {
+            let Some(found) = state.grants.get_mut(grant) else {
+                return Ok(false);
+            };
+            found.scope.bot_id = bot_id.map(str::to_owned);
+            Ok(true)
+        })
     }
 
     /// Revokes a grant and deletes all of its tokens; effective on the next request.

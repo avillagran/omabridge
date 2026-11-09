@@ -176,6 +176,60 @@ pub fn definitions(access: Access) -> Vec<Value> {
     tools
 }
 
+/// Names of the bot-mailbox tools: offered only to operate grants bound to a mailbox.
+pub const INBOX_TOOLS: [&str; 3] = ["t3_inbox_wait", "t3_inbox_ack", "t3_inbox_reply"];
+const INBOX_WAIT_DEFAULT_SECONDS: u64 = 25;
+const INBOX_PAGE: u64 = 50;
+const MAX_INBOX_ACK: usize = 100;
+
+/// Same alphabet T3 accepts for mailbox names.
+pub fn valid_bot_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id.bytes().enumerate().all(|(i, b)| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || (i > 0 && b"._-".contains(&b))
+        })
+}
+
+/// Mailbox tools for a grant bound to one bot. The mailbox is never an argument.
+pub fn inbox_definitions() -> Vec<Value> {
+    let message = json!({"type":"string","minLength":1,"maxLength":256,"description":"message_id of a mailbox message."});
+    vec![
+        tool(
+            "t3_inbox_wait",
+            "Wait for requests from T3 agents",
+            "Long-poll your mailbox for requests that agents in T3 sessions left for you. Returns as soon as one arrives, or empty with timed_out=true after timeout_seconds (default 25, at most 50); call it again to keep waiting. Each message has a message_id, the session_id it came from, an optional correlation_id and a body. Messages stay pending until answered with t3_inbox_reply or confirmed with t3_inbox_ack; pass next_cursor as after_cursor to skip ones you already saw.",
+            schema(
+                json!({"after_cursor":{"type":["integer","null"],"minimum":0},
+                "timeout_seconds":{"type":["integer","null"],"minimum":0,"maximum":MAX_WAIT_SECONDS},
+                "limit":{"type":["integer","null"],"minimum":1,"maximum":INBOX_PAGE}}),
+                &[],
+            ),
+            true,
+        ),
+        tool(
+            "t3_inbox_ack",
+            "Acknowledge mailbox messages",
+            "Mark requests as received without answering them, so t3_inbox_wait stops returning them.",
+            schema(
+                json!({"message_ids":{"type":"array","minItems":1,"maxItems":MAX_INBOX_ACK,"items":message}}),
+                &["message_ids"],
+            ),
+            false,
+        ),
+        tool(
+            "t3_inbox_reply",
+            "Answer a mailbox request",
+            "Answer a request from t3_inbox_wait. The text is delivered to the T3 session that asked, where its agent continues from it, and the request is acknowledged. client_request_id makes retries safe: the same ID delivers once.",
+            schema(
+                json!({"message_id":message,"body":{"type":"string","minLength":1,"maxLength":20000},
+                "client_request_id":{"type":"string","minLength":8,"maxLength":128,"pattern":"^[A-Za-z0-9._:-]+$"}}),
+                &["message_id", "body", "client_request_id"],
+            ),
+            false,
+        ),
+    ]
+}
+
 /// T3 run/thread status → contract status. The raw value is always returned as well.
 pub fn normalize(status: &str, pending_requests: u64) -> &'static str {
     match status {
@@ -292,7 +346,147 @@ fn event_kind(item: &Value) -> &'static str {
     }
 }
 
+/// The mailbox fields a bot may see.
+fn inbox_view(message: &Value) -> Value {
+    json!({"message_id":message["id"],"cursor":message["cursor"],"session_id":message["threadId"],
+        "correlation_id":message["correlationId"],"body":message["body"],"created_at":message["createdAt"]})
+}
+
+/// An older T3 server answers the mailbox tools with "Unknown tool".
+fn inbox_unavailable(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<ToolFailure>() {
+        Some(failure) if failure.message.contains("Unknown tool") => denied(
+            "inbox_unavailable",
+            "this environment's T3 server does not offer bot mailboxes",
+        ),
+        _ => error,
+    }
+}
+
 impl ToolContext<'_> {
+    /// Mailbox tools. The mailbox comes from the grant; whatever the caller sends is ignored
+    /// except to refuse an attempt to name one.
+    async fn inbox(&self, name: &str, args: &Map<String, Value>) -> Result<Value> {
+        self.require_operate()?;
+        let bot = self
+            .grant
+            .scope
+            .bot_id
+            .clone()
+            .ok_or_else(|| denied("forbidden", "this connection has no bot mailbox"))?;
+        ensure!(
+            !args.contains_key("bot_id") && !args.contains_key("botId"),
+            Denied(
+                "invalid_arguments",
+                "the mailbox is fixed by this connection".into()
+            )
+        );
+        match name {
+            "t3_inbox_wait" => {
+                let seconds = integer(args, "timeout_seconds", 0, MAX_WAIT_SECONDS)?
+                    .unwrap_or(INBOX_WAIT_DEFAULT_SECONDS);
+                let limit = integer(args, "limit", 1, INBOX_PAGE)?.unwrap_or(20);
+                let mut cursor = integer(args, "after_cursor", 0, u64::MAX)?.unwrap_or(0);
+                let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let page = self
+                        .upstream
+                        .call(
+                            "t3_bot_inbox_wait",
+                            json!({"botId":bot,"afterCursor":cursor,"limit":limit,
+                                "timeoutMs":remaining.as_millis() as u64}),
+                            remaining + READ_TIMEOUT,
+                        )
+                        .await
+                        .map_err(inbox_unavailable)?;
+                    self.check_active().await?;
+                    cursor = page["nextCursor"].as_u64().unwrap_or(cursor).max(cursor);
+                    // Requests from sessions this connection cannot see are never shown.
+                    let mut visible = Vec::new();
+                    let mut allowed: std::collections::HashMap<String, bool> = Default::default();
+                    for message in page["messages"].as_array().into_iter().flatten() {
+                        let session = message["threadId"].as_str().unwrap_or_default().to_owned();
+                        if !allowed.contains_key(&session) {
+                            let ok = self.session_project(&session).await.is_ok();
+                            allowed.insert(session.clone(), ok);
+                        }
+                        if allowed[&session] {
+                            visible.push(inbox_view(message));
+                        }
+                    }
+                    if !visible.is_empty() || deadline <= std::time::Instant::now() {
+                        let timed_out = visible.is_empty();
+                        return Ok(
+                            json!({"messages":visible,"next_cursor":cursor,"timed_out":timed_out}),
+                        );
+                    }
+                }
+            }
+            "t3_inbox_ack" => {
+                let ids: Vec<String> = match args.get("message_ids") {
+                    Some(Value::Array(values)) if (1..=MAX_INBOX_ACK).contains(&values.len()) => {
+                        values
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    }
+                    _ => {
+                        return Err(denied(
+                            "invalid_arguments",
+                            "message_ids must list 1 to 100 message IDs",
+                        ));
+                    }
+                };
+                let acked = self
+                    .t3("t3_bot_inbox_ack", json!({"botId":bot,"messageIds":ids}))
+                    .await
+                    .map_err(inbox_unavailable)?;
+                Ok(json!({"acked":acked["acked"]}))
+            }
+            _ => {
+                let id = required(args, "message_id")?;
+                let body = required(args, "body")?;
+                ensure!(
+                    body.chars().count() <= 20_000,
+                    Denied("invalid_arguments", "body too long".into())
+                );
+                let client_request = request_id(args)?;
+                let found = self
+                    .t3(
+                        "t3_bot_inbox_read",
+                        json!({"botId":bot,"messageId":id,"limit":1}),
+                    )
+                    .await
+                    .map_err(inbox_unavailable)?;
+                let message = found["messages"]
+                    .as_array()
+                    .and_then(|m| m.first())
+                    .filter(|m| m["direction"] == "to_bot")
+                    .ok_or_else(|| denied("not_found", "message not found"))?;
+                let session = message["threadId"].as_str().unwrap_or_default().to_owned();
+                // Same rule as sending: the session must be one this grant may see.
+                self.session_project(&session).await?;
+                let sent = self
+                    .t3(
+                        "t3_bot_inbox_reply",
+                        json!({"botId":bot,"messageId":id,"body":body,"mode":"queue",
+                            "clientRequestId":format!("{}:{client_request}", self.store.ledger_principal(&self.grant.id))}),
+                    )
+                    .await
+                    .map_err(|error| match error.downcast_ref::<ToolFailure>() {
+                        Some(failure) => denied("rejected_by_t3", failure.to_string()),
+                        None => error,
+                    })?;
+                Ok(
+                    json!({"message_id":sent["messageId"],"replied_to":id,"session_id":session,
+                    "correlation_id":sent["correlationId"],"delivery":sent["delivery"]["delivery"],
+                    "status":sent["delivery"]["status"]}),
+                )
+            }
+        }
+    }
+
     async fn t3(&self, tool: &str, args: Value) -> Result<Value> {
         self.check_active().await?;
         let authorize = || -> Result<()> {
@@ -786,6 +980,7 @@ impl ToolContext<'_> {
                     "delivery":record.delivery,"status":normalize(raw,0),"t3_status":raw,"duplicate":false}),
                 )
             }
+            "t3_inbox_wait" | "t3_inbox_ack" | "t3_inbox_reply" => self.inbox(name, args).await,
             "t3_cancel_run" => {
                 self.require_operate()?;
                 let session = required(args, "session_id")?;
@@ -804,6 +999,52 @@ impl ToolContext<'_> {
                 )
             }
             _ => bail!(Denied("unknown_tool", format!("unknown tool {name}"))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+
+    #[test]
+    fn bot_ids_follow_the_t3_alphabet() {
+        for ok in ["dot", "a", "chat.gpt_1-x", &"a".repeat(64)] {
+            assert!(valid_bot_id(ok), "{ok}");
+        }
+        for bad in ["", "Dot", "-x", ".x", "a b", "a/b", "ñ", &"a".repeat(65)] {
+            assert!(!valid_bot_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_older_t3_server_is_reported_as_inbox_unavailable() {
+        let old = anyhow!(ToolFailure {
+            code: "protocol_error".into(),
+            message: "Unknown tool".into()
+        });
+        let error = inbox_unavailable(old);
+        assert_eq!(
+            error.downcast_ref::<Denied>().unwrap().0,
+            "inbox_unavailable"
+        );
+        let other = anyhow!(ToolFailure {
+            code: "thread_not_found".into(),
+            message: "gone".into()
+        });
+        assert!(
+            inbox_unavailable(other)
+                .downcast_ref::<ToolFailure>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn the_mailbox_tools_never_take_a_mailbox_argument() {
+        for tool in inbox_definitions() {
+            let properties = tool["inputSchema"]["properties"].as_object().unwrap();
+            assert!(!properties.contains_key("bot_id") && !properties.contains_key("botId"));
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         }
     }
 }

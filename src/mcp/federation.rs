@@ -125,6 +125,9 @@ impl Router {
 
 pub fn tool_definitions(grant: &Grant) -> Vec<Value> {
     let mut tools = definitions(grant.scope.access);
+    if grant.scope.access == super::store::Access::Operate && grant.scope.bot_id.is_some() {
+        tools.extend(super::tools::inbox_definitions());
+    }
     if !grant.federated() {
         return tools;
     }
@@ -216,7 +219,11 @@ pub async fn call(
     };
     // Enforce T3's linked ceiling locally too. T3 remains authoritative.
     ensure!(
-        !(credential.access == "read-only" && matches!(name, "t3_send_message" | "t3_cancel_run")),
+        !(credential.access == "read-only"
+            && matches!(
+                name,
+                "t3_send_message" | "t3_cancel_run" | "t3_inbox_ack" | "t3_inbox_reply"
+            )),
         Denied("forbidden", "environment credential is read-only".into())
     );
     let mut arguments = args.clone();

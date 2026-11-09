@@ -288,6 +288,15 @@ enum McpCommand {
         ttl_days: u64,
         #[arg(long, default_value_t = 600)]
         code_ttl: u64,
+        /// Bot mailbox on the T3 server that this connection reads and answers (operate only).
+        #[arg(long)]
+        bot_id: Option<String>,
+    },
+    /// Bind an existing grant to a bot mailbox, or clear the binding when --bot-id is omitted.
+    GrantBot {
+        grant: String,
+        #[arg(long)]
+        bot_id: Option<String>,
     },
     Grants,
     Revoke {
@@ -503,7 +512,18 @@ async fn mcp(state_dir: &std::path::Path, command: McpCommand) -> Result<()> {
             label,
             ttl_days,
             code_ttl,
+            bot_id,
         } => {
+            ensure!(
+                bot_id.is_none() || access == omabridge::mcp::store::Access::Operate,
+                "--bot-id needs --access operate"
+            );
+            ensure!(
+                bot_id
+                    .as_deref()
+                    .is_none_or(omabridge::mcp::tools::valid_bot_id),
+                "invalid bot id: 1-64 of a-z, 0-9, '.', '_' or '-', starting with a letter or digit"
+            );
             let scope = store::GrantScope {
                 managed_catalog,
                 environments,
@@ -513,6 +533,7 @@ async fn mcp(state_dir: &std::path::Path, command: McpCommand) -> Result<()> {
                 sessions: (!sessions.is_empty()).then_some(sessions),
                 access,
                 ttl: ttl_days.saturating_mul(86400),
+                bot_id,
             };
             let (code, expires) = gateway.create_link_code(scope.clone(), code_ttl)?;
             gateway.audit(
@@ -523,6 +544,24 @@ async fn mcp(state_dir: &std::path::Path, command: McpCommand) -> Result<()> {
                 "{}",
                 json!({"link_code":code,"code_expires":expires,"scope":scope})
             );
+        }
+        McpCommand::GrantBot { grant, bot_id } => {
+            let access = gateway
+                .grants()?
+                .into_iter()
+                .find(|g| g.id == grant)
+                .map(|g| g.scope.access);
+            ensure!(access.is_some(), "unknown grant");
+            ensure!(
+                bot_id.is_none() || access == Some(omabridge::mcp::store::Access::Operate),
+                "a bot mailbox needs an operate grant"
+            );
+            ensure!(
+                gateway.set_grant_bot(&grant, bot_id.as_deref())?,
+                "unknown grant"
+            );
+            gateway.audit(json!({"event":"grant_bot_set","grant":grant,"bot_id":bot_id}))?;
+            println!("{}", json!({"grant":grant,"bot_id":bot_id}));
         }
         McpCommand::Grants => println!("{}", json!({"grants":gateway.grants()?})),
         McpCommand::Revoke { grant } => {

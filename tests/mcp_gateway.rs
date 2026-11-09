@@ -41,6 +41,10 @@ struct Fake {
     requests: HashMap<String, Value>,
     sends: usize,
     modes: Vec<String>,
+    /// Bot mailbox rows, as T3's `bot_inbox` table keeps them.
+    inbox: Vec<Value>,
+    /// Every mailbox name the gateway sent upstream.
+    inbox_bots: Vec<String>,
 }
 
 impl Fake {
@@ -216,6 +220,93 @@ impl Fake {
                 Ok(json!({"threadId":thread_id,"runId":run,"status":"interrupt_requested"}))
             }
             "t3_pending_request_list" => Ok(json!({"requestIds":[]})),
+            "t3_bot_inbox_wait" | "t3_bot_inbox_read" | "t3_bot_inbox_ack"
+            | "t3_bot_inbox_reply" => {
+                let bot = a["botId"].as_str().unwrap_or_default().to_owned();
+                self.inbox_bots.push(bot.clone());
+                let after = a["afterCursor"].as_i64().unwrap_or(0);
+                match name {
+                    "t3_bot_inbox_wait" => {
+                        let messages: Vec<_> = self
+                            .inbox
+                            .iter()
+                            .filter(|m| {
+                                m["botId"] == bot
+                                    && m["direction"] == "to_bot"
+                                    && m["ackedAt"].is_null()
+                                    && m["cursor"].as_i64().unwrap() > after
+                            })
+                            .cloned()
+                            .collect();
+                        let next = messages
+                            .iter()
+                            .filter_map(|m| m["cursor"].as_i64())
+                            .max()
+                            .unwrap_or(after);
+                        Ok(
+                            json!({"botId":bot,"messages":messages,"nextCursor":next,"timedOut":messages.is_empty()}),
+                        )
+                    }
+                    "t3_bot_inbox_read" => {
+                        let messages: Vec<_> = self
+                            .inbox
+                            .iter()
+                            .filter(|m| m["botId"] == bot && m["id"] == a["messageId"])
+                            .cloned()
+                            .collect();
+                        Ok(json!({"botId":bot,"messages":messages,"nextCursor":0}))
+                    }
+                    "t3_bot_inbox_ack" => {
+                        let mut acked = 0;
+                        for m in &mut self.inbox {
+                            if m["botId"] == bot
+                                && m["ackedAt"].is_null()
+                                && a["messageIds"].as_array().unwrap().contains(&m["id"])
+                            {
+                                m["ackedAt"] = "now".into();
+                                acked += 1;
+                            }
+                        }
+                        Ok(json!({"botId":bot,"acked":acked}))
+                    }
+                    _ => {
+                        let key = a["clientRequestId"].as_str().unwrap().to_owned();
+                        if let Some(previous) = self.requests.get(&key) {
+                            return Ok(previous.clone());
+                        }
+                        let original = self
+                            .inbox
+                            .iter_mut()
+                            .find(|m| m["botId"] == bot && m["id"] == a["messageId"])
+                            .ok_or((
+                                "invalid_request",
+                                "The mailbox message was not found.".to_owned(),
+                            ))?;
+                        original["ackedAt"] = "now".into();
+                        let thread = original["threadId"].as_str().unwrap().to_owned();
+                        let correlation = original["correlationId"].clone();
+                        self.modes
+                            .push(a["mode"].as_str().unwrap_or("auto").to_owned());
+                        self.sends += 1;
+                        let t = self.threads.get_mut(&thread).ok_or_else(missing)?;
+                        let run = format!("run:{thread}:{}", t.runs.len() + 1);
+                        t.runs.push(json!({"runId":run,"ordinal":t.runs.len()+1,"status":"queued","providerInstanceId":"codex","model":"gpt-5.5-codex","requestedAt":"t","startedAt":null,"completedAt":null}));
+                        Self::push_item(
+                            t,
+                            &run,
+                            "user_message",
+                            "completed",
+                            a["body"].as_str().unwrap(),
+                        );
+                        let id = format!("reply-{}", self.inbox.len());
+                        let cursor = self.inbox.len() as i64 + 1;
+                        self.inbox.push(json!({"cursor":cursor,"id":id,"botId":bot,"direction":"from_bot","threadId":thread,"body":a["body"],"correlationId":correlation,"ackedAt":null}));
+                        let result = json!({"messageId":id,"cursor":cursor,"repliedTo":a["messageId"],"threadId":thread,"correlationId":correlation,"delivery":{"delivery":"queued","status":"queued"}});
+                        self.requests.insert(key, result.clone());
+                        Ok(result)
+                    }
+                }
+            }
             _ => Err(("capability_denied", format!("{name} not allowed"))),
         }
     }
@@ -391,6 +482,27 @@ impl Env {
                     sessions: Some(vec!["t-essential".into()]),
                     access,
                     ttl: 3600,
+                    bot_id: None,
+                },
+                300,
+            )
+            .unwrap()
+            .0
+    }
+    /// An all-session grant on project p1 bound to a bot mailbox.
+    fn bot_grant(&self, bot: Option<&str>, access: Access) -> String {
+        self.store
+            .create_link_code(
+                GrantScope {
+                    managed_catalog: None,
+                    environments: Vec::new(),
+                    label: "dot".into(),
+                    projects: vec!["p1".into()],
+                    all_projects: false,
+                    sessions: None,
+                    access,
+                    ttl: 3600,
+                    bot_id: bot.map(str::to_owned),
                 },
                 300,
             )
@@ -409,6 +521,7 @@ impl Env {
                     label: "managed-test".into(),
                     access,
                     ttl: 3600,
+                    bot_id: None,
                 },
                 300,
             )
@@ -492,6 +605,7 @@ impl Env {
                     sessions: sessions.map(|s| s.iter().map(|s| s.to_string()).collect()),
                     access,
                     ttl: 3600,
+                    bot_id: None,
                 },
                 300,
             )
@@ -783,6 +897,7 @@ fn federation_intersects_native_catalog_without_copying_registry() -> Result<()>
             sessions: None,
             access: Access::Operate,
             ttl: 3600,
+            bot_id: None,
         },
         300,
     )?;
@@ -1822,6 +1937,7 @@ async fn an_all_projects_grant_sees_and_watches_every_project() -> Result<()> {
                     sessions: None,
                     access: Access::Read,
                     ttl: 60,
+                    bot_id: None,
                 },
                 60,
             )
@@ -2517,5 +2633,207 @@ async fn managed_withdrawal_during_descriptor_check_sends_no_bearer_request() ->
     assert!(env.call(&token, "t3_send_message", json!({"environment_id":A,"session_id":"t-essential","message":"denied before bearer","client_request_id":"descriptor-race-denied-0001"})).await?.0);
     assert_eq!(env.fake.lock().unwrap().credential_requests, before);
     assert_eq!(env.fake.lock().unwrap().sends, 0);
+    Ok(())
+}
+
+fn mail(cursor: i64, thread: &str, correlation: Option<&str>, body: &str) -> Value {
+    json!({"cursor":cursor,"id":format!("m{cursor}"),"botId":"dot","direction":"to_bot","threadId":thread,
+        "environmentId":"e","body":body,"correlationId":correlation,"replyTo":null,
+        "createdAt":"2026-11-09T00:00:00.000Z","ackedAt":null})
+}
+
+#[tokio::test]
+async fn bot_mailbox_tools_are_offered_only_to_operate_grants_bound_to_a_mailbox() -> Result<()> {
+    let env = Env::new().await?;
+    let names = |token: String| {
+        let env = &env;
+        async move {
+            let (_, list) = env.rpc(&token, "tools/list", json!({})).await.unwrap();
+            list["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        }
+    };
+    let unbound = env
+        .connect(&env.bot_grant(None, Access::Operate))
+        .await?
+        .unwrap();
+    let read_only = env
+        .connect(&env.bot_grant(Some("dot"), Access::Read))
+        .await?
+        .unwrap();
+    let bound = env
+        .connect(&env.bot_grant(Some("dot"), Access::Operate))
+        .await?
+        .unwrap();
+    for (token, offered) in [
+        (unbound.clone(), false),
+        (read_only, false),
+        (bound.clone(), true),
+    ] {
+        let listed = names(token).await;
+        for tool in ["t3_inbox_wait", "t3_inbox_ack", "t3_inbox_reply"] {
+            assert_eq!(listed.iter().any(|n| n == tool), offered, "{tool}");
+        }
+    }
+    // Calling a tool that was not offered is refused, not forwarded.
+    let (failed, value) = env.call(&unbound, "t3_inbox_wait", json!({})).await?;
+    assert!(failed && value["error"]["code"] == "forbidden", "{value}");
+    assert!(env.fake.lock().unwrap().inbox_bots.is_empty());
+    // The mailbox is fixed by the grant: naming one is an error, not an override.
+    let (failed, value) = env
+        .call(
+            &bound,
+            "t3_inbox_wait",
+            json!({"bot_id":"other","timeout_seconds":0}),
+        )
+        .await?;
+    assert!(
+        failed && value["error"]["code"] == "invalid_arguments",
+        "{value}"
+    );
+    assert!(env.fake.lock().unwrap().inbox_bots.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn bot_requests_are_scoped_to_the_grant_answered_once_and_acknowledged() -> Result<()> {
+    let env = Env::new().await?;
+    let token = env
+        .connect(&env.bot_grant(Some("dot"), Access::Operate))
+        .await?
+        .unwrap();
+    {
+        let mut fake = env.fake.lock().unwrap();
+        fake.inbox = vec![
+            mail(
+                1,
+                "t-foreign",
+                Some("secret"),
+                "from a project this grant cannot see",
+            ),
+            mail(
+                2,
+                "t-essential",
+                Some("sodexo-1"),
+                "What is the invoice number?",
+            ),
+        ];
+    }
+    let waited = env
+        .ok(&token, "t3_inbox_wait", json!({"timeout_seconds":0}))
+        .await;
+    assert_eq!(waited["timed_out"], false);
+    let messages = waited["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1, "{waited}");
+    assert_eq!(messages[0]["session_id"], "t-essential");
+    assert_eq!(messages[0]["correlation_id"], "sodexo-1");
+    assert_eq!(messages[0]["body"], "What is the invoice number?");
+    assert_eq!(
+        waited["next_cursor"], 2,
+        "the hidden request is skipped, not shown"
+    );
+    let again = env
+        .ok(
+            &token,
+            "t3_inbox_wait",
+            json!({"timeout_seconds":0,"after_cursor":2}),
+        )
+        .await;
+    assert_eq!(again["timed_out"], true);
+    assert_eq!(again["messages"], json!([]));
+
+    // A request from a session outside the grant cannot be answered, and nothing is sent.
+    let (failed, value) = env
+        .call(
+            &token,
+            "t3_inbox_reply",
+            json!({"message_id":"m1","body":"hi","client_request_id":"reply-0001"}),
+        )
+        .await?;
+    assert!(failed && value["error"]["code"] == "not_found", "{value}");
+    assert_eq!(env.fake.lock().unwrap().sends, 0);
+
+    let reply = json!({"message_id":"m2","body":"INV-4471","client_request_id":"reply-0002"});
+    let sent = env.ok(&token, "t3_inbox_reply", reply.clone()).await;
+    assert_eq!(sent["session_id"], "t-essential");
+    assert_eq!(sent["correlation_id"], "sodexo-1");
+    assert_eq!(sent["replied_to"], "m2");
+    let repeated = env.ok(&token, "t3_inbox_reply", reply).await;
+    assert_eq!(repeated["message_id"], sent["message_id"]);
+    {
+        let fake = env.fake.lock().unwrap();
+        assert_eq!(fake.sends, 1, "a retried reply is delivered once");
+        assert!(fake.modes.iter().all(|m| m == "queue"));
+        assert!(
+            fake.inbox_bots.iter().all(|b| b == "dot"),
+            "{:?}",
+            fake.inbox_bots
+        );
+    }
+    let after_reply = env
+        .ok(&token, "t3_inbox_wait", json!({"timeout_seconds":0}))
+        .await;
+    assert_eq!(
+        after_reply["messages"],
+        json!([]),
+        "a reply acknowledges the request"
+    );
+
+    env.fake
+        .lock()
+        .unwrap()
+        .inbox
+        .push(mail(9, "t-essential", None, "fyi"));
+    let acked = env
+        .ok(&token, "t3_inbox_ack", json!({"message_ids":["m9"]}))
+        .await;
+    assert_eq!(acked["acked"], 1);
+    let (failed, value) = env
+        .call(&token, "t3_inbox_ack", json!({"message_ids":[]}))
+        .await?;
+    assert!(
+        failed && value["error"]["code"] == "invalid_arguments",
+        "{value}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_existing_grant_can_be_bound_to_a_mailbox_and_revocation_wins() -> Result<()> {
+    let env = Env::new().await?;
+    let token = env
+        .connect(&env.bot_grant(None, Access::Operate))
+        .await?
+        .unwrap();
+    let grant = env.store.grants()?.remove(0);
+    assert!(env.store.set_grant_bot(&grant.id, Some("dot"))?);
+    assert!(
+        env.store
+            .set_grant_bot(&grant.id, Some("Not Valid"))
+            .is_err()
+    );
+    assert!(!env.store.set_grant_bot("missing", Some("dot"))?);
+    env.fake
+        .lock()
+        .unwrap()
+        .inbox
+        .push(mail(1, "t-essential", None, "hello"));
+    let waited = env
+        .ok(&token, "t3_inbox_wait", json!({"timeout_seconds":0}))
+        .await;
+    assert_eq!(waited["messages"].as_array().unwrap().len(), 1);
+    env.store.revoke(&grant.id)?;
+    let (status, _) = env
+        .rpc(
+            &token,
+            "tools/call",
+            json!({"name":"t3_inbox_wait","arguments":{}}),
+        )
+        .await?;
+    assert_eq!(status, 401);
     Ok(())
 }

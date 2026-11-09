@@ -71,6 +71,26 @@ OpenAI requires function names to match `^[A-Za-z0-9_-]+$`, so a tool such as `t
 
 ChatGPT does not keep server streams open, and T3 offers no push over MCP. For a single conversation, use `t3_get_events` with a cursor and `t3_wait_run` for short waits. To be told when something happens, subscribe to the MCP Events in section 3.1.
 
+### 3.2 Bot mailbox (agent-initiated messages)
+
+MCP is pull-only, so an agent in a T3 session cannot start a conversation with ChatGPT. An O3 server that
+offers bot mailboxes (`t3_bot_inbox_*`, see the o3-server `docs/MCP.md`) lets agents leave requests for a named
+bot. The gateway exposes that mailbox to **one** grant, with three more tools:
+
+| Tool | Access | T3 equivalent | Purpose |
+|---|---|---|---|
+| `t3_inbox_wait` | operate + mailbox | `t3_bot_inbox_wait` | long-polls (default 25 s, at most 50 s) for requests; `timed_out=true` and an empty list when none arrive. Pass `next_cursor` as `after_cursor` to skip requests already seen |
+| `t3_inbox_reply` | operate + mailbox | `t3_bot_inbox_read` + `t3_bot_inbox_reply` | answers a request; the text reaches the asking session through the usual queue, and the request is acknowledged. `client_request_id` makes retries deliver once |
+| `t3_inbox_ack` | operate + mailbox | `t3_bot_inbox_ack` | marks requests as received without answering |
+
+The mailbox name is part of the grant and is never an argument: `mcp grant --access operate --bot-id dot ...`
+binds a new grant, and `mcp grant-bot <grant-id> --bot-id dot` binds an existing one without a new OAuth consent
+(omit `--bot-id` to clear it). Grants without a mailbox, and read-only grants, are not offered these tools and
+cannot call them. Requests from sessions the grant may not see are never shown, and a reply to one is `not_found`.
+On a federated grant every call carries `environment_id`, and the mailbox lives on the environment whose agents
+posted the request; poll each environment you expect requests from. An environment whose T3 server predates
+mailboxes answers `inbox_unavailable`.
+
 ### 3.1 MCP Events
 
 With protocol `2026-07-28`, the gateway answers `server/discover` with the `events` capability and serves `events/list`, `events/subscribe` and `events/unsubscribe` on the same authenticated `/mcp` endpoint. ChatGPT Work chats and [dots](https://learn.chatgpt.com/docs/dots) use them: they subscribe with a callback URL and a `whsec_` signing secret, and the gateway posts each matching event there ([OpenAI: MCP Events](https://developers.openai.com/plugins/build/mcp-events)).
