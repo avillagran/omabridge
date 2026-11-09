@@ -630,9 +630,56 @@ async fn shutdown_signal() -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run(Args::parse()).await {
+/// Worker threads for the async runtime. A relay is I/O bound, so a handful of workers is
+/// plenty; tokio's default of one per CPU multiplies stacks and allocator arenas on big hosts.
+const DEFAULT_WORKER_THREADS: usize = 4;
+
+fn worker_threads() -> usize {
+    std::env::var("OMABRIDGE_WORKER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(DEFAULT_WORKER_THREADS, |count| count.get())
+                .min(DEFAULT_WORKER_THREADS)
+        })
+}
+
+/// glibc gives every thread its own malloc arena (up to 8x the CPU count), and each keeps freed
+/// pages around. Two arenas and an eager trim keep the resident set close to the live data.
+/// Must run before any thread is spawned; an explicit `MALLOC_ARENA_MAX` still wins.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn bound_allocator() {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return;
+    }
+    // SAFETY: mallopt only adjusts allocator tunables and is called before other threads exist.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 128 * 1024);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn bound_allocator() {}
+
+fn main() {
+    bound_allocator();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads())
+        .max_blocking_threads(16)
+        .thread_keep_alive(std::time::Duration::from_secs(5))
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("omabridge: cannot start the async runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = runtime.block_on(run(Args::parse())) {
         eprintln!("omabridge: {error:#}");
         std::process::exit(1);
     }
